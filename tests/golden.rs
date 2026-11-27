@@ -121,11 +121,11 @@ fn vcarve_with_flat_tool_is_an_error() {
 // Files live in tests/golden/<project>/; tests/golden/README.md explains them. `UPDATE_GOLDEN=1` rewrites them.
 // ================================================================================================================
 mod matrix {
-    use putiacnc_core::model::{Machine, ProjectData, DIALECTS};
-    use putiacnc_core::pieces::{file_suffix, generate_parts};
+    use putiacnc_core::model::{Machine, Operation, PlugPiece, ProjectData, Relief, DIALECTS};
+    use putiacnc_core::pieces::{default_piece, file_suffix, generate_parts};
     use putiacnc_core::sample::{fill_kind, Kind};
     use putiacnc_core::split::{generate_files, groups, Split};
-    use putiacnc_core::{load_project, shapes, Units};
+    use putiacnc_core::{load_project, setup, shapes, Units};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -139,24 +139,43 @@ mod matrix {
     fn golden_dir() -> PathBuf { root().join("tests").join("golden") }
     fn updating() -> bool { std::env::var_os("UPDATE_GOLDEN").is_some_and(|v| !v.is_empty() && v != "0") }
 
+    /// The settings of the machine and job that the matrix keeps fixed and the option cases (below) change.
+    #[derive(Clone, Copy)]
+    struct Opts {
+        /// Line numbers (`Machine.numbered`, which the app copies to `job.numbered`).
+        numbered: bool,
+        /// The machine's own start and end lines (`Machine.start_code` / `end_code`).
+        start: Option<&'static str>,
+        end: Option<&'static str>,
+        /// The work coordinate system (`job.wcs`); `None` keeps the project's.
+        wcs: Option<u8>,
+        /// Seconds the spindle gets to come up to speed (`Machine.spin_up`).
+        spin_up: f64,
+    }
+
+    /// The fixed machine of the matrix.
+    const PLAIN: Opts = Opts { numbered: false, start: None, end: None, wcs: None, spin_up: 2.0 };
+
     /// The machine every case runs on, so nothing depends on the local setup: the app's default machine with fixed
-    /// values. Dialect, units and arcs are the case's.
-    fn machine(post: &str, units: Units, arcs: bool) -> Machine {
+    /// values. Dialect, units and arcs are the case's; `o` is `PLAIN` except for the option cases.
+    fn machine(post: &str, units: Units, arcs: bool, o: &Opts) -> Machine {
         Machine {
             id: "golden".into(), name: "Golden test machine".into(), rapid: 2000.0, tsc: 1.2, x: 300.0, y: 200.0, z: 60.0,
-            post: Some(post.into()), numbered: Some(false), safe: Some(5.0), inches: Some(units == Units::Imperial), arcs: Some(arcs), spin_up: Some(2.0),
+            post: Some(post.into()), numbered: Some(o.numbered), safe: Some(5.0), inches: Some(units == Units::Imperial), arcs: Some(arcs), spin_up: Some(o.spin_up),
+            start_code: o.start.map(String::from), end_code: o.end.map(String::from),
             ..Machine::default()
         }
     }
 
     /// Puts the case's machine on a project the way the app does when a machine is chosen (`apply_machine_job` in
     /// gui/src/machmgr.rs): the machine decides the dialect, the line numbers and the safe Z.
-    fn on_machine(d: &ProjectData, post: &str, units: Units, arcs: bool) -> ProjectData {
+    fn on_machine(d: &ProjectData, post: &str, units: Units, arcs: bool, o: &Opts) -> ProjectData {
         let mut d = d.clone();
-        let m = machine(post, units, arcs);
+        let m = machine(post, units, arcs, o);
         d.job.post = m.post.clone().unwrap_or_default();
         d.job.numbered = m.numbered.unwrap_or(false);
         d.job.safe = m.safe.unwrap_or(5.0);
+        if let Some(w) = o.wcs { d.job.wcs = w; }
         d.machine = Some(m);
         d
     }
@@ -178,7 +197,7 @@ mod matrix {
     fn sample(k: Kind, units: Units) -> ProjectData {
         let mut f = shapes::blank_project();
         for (i, t) in f.data.tools.iter_mut().enumerate() { t.id = format!("t{:02}", i + 1); }
-        f.data = on_machine(&f.data, "", units, false);
+        f.data = on_machine(&f.data, "", units, false, &PLAIN);
         fill_kind(&mut f.data, units == Units::Imperial, k).unwrap_or_else(|e| panic!("{}: {e}", sample_slug(k)));
         f.data
     }
@@ -187,8 +206,8 @@ mod matrix {
     fn units_slug(u: Units) -> &'static str { if u == Units::Imperial { "imperial" } else { "metric" } }
 
     /// What one case writes: (file name, contents) for the G-code and its notes.
-    fn case_files(d: &ProjectData, post: &str, units: Units, arcs: bool) -> Vec<(String, String)> {
-        let d = on_machine(d, post, units, arcs);
+    fn case_files(d: &ProjectData, post: &str, units: Units, arcs: bool, o: &Opts) -> Vec<(String, String)> {
+        let d = on_machine(d, post, units, arcs, o);
         let base = format!("{}-{}-{}", dialect_slug(post), units_slug(units), if arcs { "arcs" } else { "noarcs" });
         let notes = |n: &[String]| n.iter().map(|x| format!("{x}\n")).collect::<String>();
         let mut out = vec![];
@@ -213,11 +232,16 @@ mod matrix {
 
     /// Every case of one project, in the cross product dialect x units x arcs. `make` builds the project for the units.
     fn project_files(make: &dyn Fn(Units) -> ProjectData) -> Vec<(String, String)> {
+        files_for(make, &PLAIN, &[Units::Metric, Units::Imperial], &[false, true])
+    }
+
+    /// The files of one project in every dialect, for the given units and arcs settings, on the machine with options `o`.
+    fn files_for(make: &dyn Fn(Units) -> ProjectData, o: &Opts, units: &[Units], arcs: &[bool]) -> Vec<(String, String)> {
         let mut all = vec![];
-        for units in [Units::Metric, Units::Imperial] {
+        for &units in units {
             let d = make(units);
             for (post, _) in DIALECTS {
-                for arcs in [false, true] { all.extend(case_files(&d, post, units, arcs)); }
+                for &arcs in arcs { all.extend(case_files(&d, post, units, arcs, o)); }
             }
         }
         all
@@ -351,12 +375,176 @@ mod matrix {
         }
     }
 
+    // ---------- option cases: emitter paths the cross product above never reaches ----------
+    //
+    // The matrix forces the fixed machine's line numbers, start/end code, spin-up and work offset onto every project, and
+    // none of its projects pauses, draws with a pen, uses a Corners tool, cuts trochoidal loops, carves a photo or has a
+    // plug on a separate piece. These cases close that gap before the emitter is refactored (phase 1 of the spec). Every
+    // dialect; metric only unless the units change text the matrix does not show (see tests/golden/README.md).
+
+    /// One option case: a small project, the machine options it runs with, and the units and arcs settings it is written in.
+    struct Case { slug: &'static str, make: fn(Units) -> ProjectData, opts: Opts, units: &'static [Units], arcs: &'static [bool] }
+
+    const METRIC: &[Units] = &[Units::Metric];
+    const NOARCS: &[bool] = &[false];
+    const START: &str = "(start code: dust shoe down)\n  M8  \n\nG4 P1";
+    const END: &str = "M9\n(end code: dust shoe up)";
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case { slug: "opt-numbered", make: |_| small_job(false), opts: Opts { numbered: true, ..PLAIN }, units: METRIC, arcs: &[false, true] },
+            Case { slug: "opt-start-end-code", make: |_| small_job(false), opts: Opts { start: Some(START), end: Some(END), ..PLAIN }, units: METRIC, arcs: NOARCS },
+            Case { slug: "opt-start-end-code-numbered", make: |_| small_job(false), opts: Opts { numbered: true, start: Some(START), end: Some(END), ..PLAIN }, units: METRIC, arcs: NOARCS },
+            Case { slug: "opt-wcs-g56-spin0", make: |_| small_job(false), opts: Opts { wcs: Some(2), spin_up: 0.0, ..PLAIN }, units: METRIC, arcs: NOARCS },
+            Case { slug: "opt-wcs-g59-1", make: |_| small_job(false), opts: Opts { wcs: Some(6), ..PLAIN }, units: METRIC, arcs: NOARCS },
+            Case { slug: "pause", make: |_| load("hardware_m0_aircut"), opts: PLAIN, units: METRIC, arcs: NOARCS },
+            Case { slug: "pen", make: pen, opts: PLAIN, units: &[Units::Metric, Units::Imperial], arcs: NOARCS },
+            Case { slug: "pen-tool-change", make: |_| small_job(true), opts: PLAIN, units: METRIC, arcs: NOARCS },
+            Case { slug: "rest-pocket", make: rest_pocket, opts: PLAIN, units: METRIC, arcs: NOARCS },
+            Case { slug: "trochoidal", make: trochoidal, opts: PLAIN, units: METRIC, arcs: NOARCS },
+            Case { slug: "photo-vcarve", make: photo, opts: PLAIN, units: METRIC, arcs: NOARCS },
+            Case { slug: "plug-piece", make: plug_piece, opts: PLAIN, units: METRIC, arcs: NOARCS },
+        ]
+    }
+
+    fn check_case(slug: &str) {
+        let c = cases().into_iter().find(|c| c.slug == slug).unwrap_or_else(|| panic!("no case {slug}"));
+        check_project(c.slug, files_for(&c.make, &c.opts, c.units, c.arcs));
+    }
+
+    #[test] fn golden_opt_numbered() { check_case("opt-numbered"); }
+    #[test] fn golden_opt_start_end_code() { check_case("opt-start-end-code"); }
+    #[test] fn golden_opt_start_end_code_numbered() { check_case("opt-start-end-code-numbered"); }
+    #[test] fn golden_opt_wcs_g56_spin0() { check_case("opt-wcs-g56-spin0"); }
+    #[test] fn golden_opt_wcs_g59_1() { check_case("opt-wcs-g59-1"); }
+    #[test] fn golden_pause() { check_case("pause"); }
+    #[test] fn golden_pen() { check_case("pen"); }
+    #[test] fn golden_pen_tool_change() { check_case("pen-tool-change"); }
+    #[test] fn golden_rest_pocket() { check_case("rest-pocket"); }
+    #[test] fn golden_trochoidal() { check_case("trochoidal"); }
+    #[test] fn golden_photo_vcarve() { check_case("photo-vcarve"); }
+    #[test] fn golden_plug_piece() { check_case("plug-piece"); }
+
+    /// Every case has its test above (a case without one would never be compared).
+    #[test] fn every_case_has_a_test() {
+        let src = include_str!("golden.rs");
+        for c in cases() { assert!(src.contains(&format!("check_case(\"{}\")", c.slug)), "case {} has no #[test]", c.slug); }
+    }
+
+    fn load(name: &str) -> ProjectData {
+        load_project(&fs::read_to_string(super::data(&format!("{name}.project.json"))).unwrap()).unwrap_or_else(|e| panic!("{name}: {e}")).data
+    }
+
+    /// A new project with the bundled tools, their ids pinned (the real ones come from the clock).
+    fn blank() -> ProjectData {
+        let mut d = shapes::blank_project().data;
+        for (i, t) in d.tools.iter_mut().enumerate() { t.id = format!("t{:02}", i + 1); }
+        d
+    }
+
+    /// A small two-tool job on a 60 x 40 x 6 mm stock, 1 mm deep in one pass, no ramp: a 3 mm cutter round a 15 x 10 mm rectangle, then
+    /// a 6 mm cutter inside a 16 mm circle (a tool change in every dialect, arcs to fit). With `pen`: a pause after the first
+    /// operation (with the default message) and a pen drawing a rectangle between the two cutters, so `select_pen` changes from
+    /// a cutter with the spindle stopped and `select_tool` changes back from the pen.
+    fn small_job(pen: bool) -> ProjectData {
+        let mut d = blank();
+        d.stock.w = 60.0; d.stock.h = 40.0; d.stock.t = 6.0;
+        let tool = |d: &ProjectData, n: &str| d.tools.iter().find(|t| t.name == n).map(|t| t.id.clone()).unwrap_or_else(|| panic!("no {n}"));
+        let op = |id: i64, tool: String, kind: &str| {
+            let mut p = shapes::default_op_params(&tool);
+            p.kind = kind.into(); p.depth = 1.0; p.pass_depth = Some(1.0); p.ramp = false;
+            Operation { id, p }
+        };
+        let (t3, t6) = (tool(&d, "3 mm flat end mill"), tool(&d, "6 mm flat end mill"));
+        d.ops.push(op(1, t3, "outside"));
+        d.loops.push(shapes::new_rect([5.0, 5.0], [20.0, 15.0], 0.0, 1));
+        if pen {
+            let p = load("hardware_pen_test").tools[0].clone();
+            d.ops[0].p.pause = Some(String::new());
+            d.ops.push(op(2, p.id.clone(), "draw"));
+            d.ops[1].p.depth = 0.0;
+            d.tools.push(p);
+            d.loops.push(shapes::new_rect([25.0, 5.0], [35.0, 15.0], 0.0, 2));
+        }
+        d.ops.push(op(3, t6, "inside"));
+        d.loops.push(shapes::new_circle([45.0, 25.0], 8.0, 3));
+        d.oid = 3;
+        d
+    }
+
+    /// The pen test (an air run, a pause without the spindle, the real drawing), with a pen-down dwell on the second operation
+    /// (0.125 s, written with two decimals: `G4 P0.13`).
+    fn pen(_: Units) -> ProjectData {
+        let mut d = load("hardware_pen_test");
+        d.ops[1].p.dwell = Some(0.125);
+        d
+    }
+
+    /// A pocket with a 6 mm cutter and a 2 mm Corners tool (rest machining), as `PUTIACNC_SHOW_REST` makes it.
+    fn rest_pocket(_: Units) -> ProjectData {
+        let mut d = blank();
+        let by = |d: &ProjectData, n: &str| d.tools.iter().find(|t| t.name == n).map(|t| t.id.clone()).unwrap_or_else(|| panic!("no {n}"));
+        let mut p = shapes::default_op_params(&by(&d, "6 mm flat end mill"));
+        p.kind = "pocket".into(); p.depth = 4.0; p.rest = Some(by(&d, "2 mm flat end mill"));
+        d.stock.w = 100.0; d.stock.h = 80.0; d.stock.t = 10.0;
+        d.ops.push(Operation { id: 1, p }); d.oid = 1; d.act = 1;
+        d.loops.push(shapes::new_rect([20.0, 20.0], [80.0, 60.0], 0.0, 1));
+        d
+    }
+
+    /// Trochoidal clearing of the pocket with an island, as tests/trochoidal.rs makes it: with arcs off, only the loops are
+    /// fitted as arcs (the per-range fitter).
+    fn trochoidal(_: Units) -> ProjectData {
+        let mut d = load("pocket_island");
+        for o in d.ops.iter_mut() { o.p.troch = true; o.p.ramp = false; o.p.depth = 1.5; o.p.pass_depth = Some(1.5); }
+        d
+    }
+
+    /// A photo V-carve of a 60 x 40 mm gradient on a 100 x 100 x 12 mm stock, as tests/photo_vcarve.rs makes it.
+    fn photo(_: Units) -> ProjectData {
+        let mut d = blank();
+        d.stock.w = 100.0; d.stock.h = 100.0; d.stock.t = 12.0;
+        d.tools = setup::starter_tools(setup::ToolChoice { vbits: true, ..Default::default() });
+        for (i, t) in d.tools.iter_mut().enumerate() { t.id = format!("t{:02}", i + 1); }
+        let (nx, ny) = (240usize, 160usize);
+        let mut b = Vec::new();
+        for _ in 0..ny { for i in 0..nx { b.extend(((65535 - i * 65535 / (nx - 1)) as u16).to_le_bytes()); } }
+        d.relief = Some(Relief { name: "gradient".into(), nx, ny, res: 0.25, zmax: 3.0, hm: b64(&b), x: 20.0, y: 30.0, scale: 1.0, edge: false });
+        shapes::add_operation(&mut d, &Default::default(), "photo").expect("a photo operation");
+        d
+    }
+
+    fn b64(d: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut o = String::new();
+        for c in d.chunks(3) {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            o.push(A[(n >> 18) as usize & 63] as char); o.push(A[(n >> 12) as usize & 63] as char);
+            o.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+            o.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+        }
+        o
+    }
+
+    /// An inlay whose plug is cut from a separate 8 mm piece, as the tests in src/pieces.rs make it: a `-plug` file.
+    fn plug_piece(_: Units) -> ProjectData {
+        let mut d = blank();
+        d.loops.push(shapes::new_rect([30.0, 40.0], [50.0, 50.0], 0.0, 0));
+        let sel: std::collections::BTreeSet<usize> = [0].into_iter().collect();
+        assert!(shapes::add_operation(&mut d, &sel, "inlay").is_none());
+        let (pocket, plug) = (d.ops[0].id, d.ops[1].id);
+        let piece = PlugPiece { t: 8.0, mat: "darkwood".into(), ..default_piece(&d.stock) };
+        shapes::put_plug_on_piece(&mut d, pocket, plug, Some(piece));
+        d
+    }
+
     /// Every directory in tests/golden/ belongs to a project that is still checked (a renamed example leaves none behind).
     #[test]
     fn golden_dirs_have_a_project() {
         if updating() { return; } // the other tests are writing them
         let mut known: Vec<String> = example_projects().into_iter().map(|(s, _)| s).collect();
         known.extend([Kind::NamePlate, Kind::Box, Kind::Relief, Kind::ShapedRelief, Kind::Oval].map(|k| sample_slug(k).to_string()));
+        known.extend(cases().iter().map(|c| c.slug.to_string()));
         for e in fs::read_dir(golden_dir()).unwrap().flatten().filter(|e| e.path().is_dir()) {
             let n = e.file_name().to_string_lossy().into_owned();
             assert!(known.contains(&n), "tests/golden/{n} has no project: remove it, or add the project back");

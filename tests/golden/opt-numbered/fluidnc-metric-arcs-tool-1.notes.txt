@@ -1,0 +1,1 @@
+4 arcs written as G2/G3: shorter file; run an air cut first if this machine has not done arcs before.

@@ -1,0 +1,1 @@
+Golden test machine: 3 start lines and 2 end lines of your own G-code added; the time estimate does not include any moves in them.
