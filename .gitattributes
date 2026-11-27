@@ -1,0 +1,2 @@
+# VCarve fixtures for the TX-35 post are compared byte for byte, CRLF line endings included: never convert them.
+tests/data/tx35/** -text
