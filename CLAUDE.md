@@ -23,7 +23,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 Narrower loops while working:
 
 ```bash
-cargo test --test golden                      # G-code snapshots in tests/data
+cargo test --test golden                      # G-code snapshots in tests/data and the matrix in tests/golden
 cargo test -p putiacnc-core                   # core only, no GUI build
 cargo run --bin putia-gcode -- tests/data/two_ops_toolchange.project.json -o /tmp/out.nc
 ```

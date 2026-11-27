@@ -1,2 +1,4 @@
 # VCarve fixtures for the TX-35 post are compared byte for byte, CRLF line endings included: never convert them.
 tests/data/tx35/** -text
+# Golden G-code (tests/golden.rs) is compared byte for byte: keep LF line endings on every platform.
+tests/golden/** -text

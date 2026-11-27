@@ -1,0 +1,2 @@
+Some shapes have no operation (not machined).
+Op 1: the detail tool finishes the 16% of the surface the finishing tool could not reach.
