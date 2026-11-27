@@ -40,7 +40,7 @@ fn each_operation_gets_its_own_share_and_the_spindle_wait_is_what_is_left() {
 
 #[test]
 fn a_list_of_no_moves_is_empty_and_finite() {
-    let o = putiacnc_core::toolpath::Output { lines: vec![], moves: vec![], time_min: 0.5, cut_time_min: 0.0, cut_len_mm: 0.0, notes: vec![], tab_marks: vec![] };
+    let o = putiacnc_core::toolpath::Output { lines: vec![], program: Default::default(), moves: vec![], time_min: 0.5, cut_time_min: 0.0, cut_len_mm: 0.0, notes: vec![], tab_marks: vec![] };
     let t = o.timing(3);
     assert_eq!(t.ops.len(), 3);
     assert!((t.waits - 0.5).abs() < 1e-12);

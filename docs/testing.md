@@ -17,7 +17,9 @@ CI (`.github/workflows/ci.yml`) runs both on every push to `main` and every pull
   `verify_programs.rs`, which re-reads the text with an independent checker.
 - **Golden matrix** (also `tests/golden.rs`, files in `tests/golden/`): every `examples/**/*.project.json` and every
   built-in sample, on a fixed machine, in every dialect, mm and inches, arcs off and on, as one file and split per tool,
-  compared byte for byte with the notes. `UPDATE_GOLDEN=1 cargo test --test golden` rewrites them; see
+  compared byte for byte with the notes, plus option cases for what that cross product never reaches (line numbers, the
+  machine's start/end code, work offsets, pauses, pen drawing, rest machining, trochoidal loops, photo V-carve, plug
+  pieces). `UPDATE_GOLDEN=1 cargo test --test golden` rewrites them; see
   `tests/golden/README.md`. This is the gate for the post-processor refactor (`docs/post-processor-spec.md`, phase 0).
 - **Replay** (`tests/replay.rs`, `tests/common`): the G-code text is played back the way the 3D preview does it (steps with their line, arcs cut into short pieces, stops, waits, tools) and held to what the generator says: cutting length, time, end point, the passes and their lowest Z, the second tool, the levelling lap. Every random project goes through the same check.
 - **Random projects** (`tests/random_projects.rs`): projects built from a seed (stock, tools, one to three operations

@@ -21,6 +21,7 @@ pub mod motion;
 pub mod nest;
 pub mod pieces;
 pub mod photo;
+pub mod program;
 pub mod relief;
 pub mod reliefshapes;
 pub mod replay;

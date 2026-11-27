@@ -31,7 +31,8 @@ changes the project inside a drawing function, it probably belongs in core.
 | `arcs` | Rewrites runs of short straight moves that lie on a circle as G2/G3 lines. |
 | `trim`, `cleanup` | The Trim and Extend tool; the Clean up command for imported drawings (joins paths, drops duplicates, finds open contours). |
 | `svg`, `dxf`, `bitmap`, `text` | Importers and the font-to-outline code. |
-| `toolpath` | `generate(&ProjectData, Units) -> Output`: profile, pocket, V-carve, drill, inlay, tabs, lead-in, G-code lines and a time estimate. |
+| `toolpath` | `generate(&ProjectData, Units) -> Output`: profile, pocket, V-carve, drill, inlay, tabs, lead-in; the emitter pushes the program as events, with the move list and a time estimate. |
+| `program` | The intermediate representation between the generator and the text (`Program`, `Event`, phase 1 of `docs/post-processor-spec.md`), and `render_canonical`: the events written as the built-in dialects' text (moves, setup, tool change, spindle, dwell, stops, end, arc fitting, start/end code, Marlin comments, line numbers), with a source map from each line to its event. |
 | `relief` | The 3D model roughing, finishing and detail (rest machining) passes. |
 | `rest` | Rest machining of pockets: what the main cutter leaves (the pocket minus the pocket "opened" by the cutter) and the area a smaller cutter must visit. |
 | `joints` | Dogbone corner reliefs and finger joints, and the box plates. |
