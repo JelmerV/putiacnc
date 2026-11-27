@@ -11,6 +11,8 @@
 #   -e VAR=VAL  an extra PUTIACNC_* setting, e.g. -e PUTIACNC_VIEW=3d (can be repeated; see docs/testing.md)
 #   -b BINARY   the program (default $CARGO_TARGET_DIR/debug/putiacnc, else target/debug/putiacnc)
 #
+# Exits 1 and writes no picture if the program dies before the picture is taken, or if the whole screen is one colour
+# (the window never drew); the program's last output is printed.
 # It always uses its own virtual X11 screen (:99, or $SHOT_DISPLAY), so it works the same under Wayland.
 #
 # Examples:
@@ -22,7 +24,7 @@ while getopts "o:w:t:c:s:e:b:h" o; do
   case $o in
     o) out=$OPTARG ;; w) win=$OPTARG ;; t) theme=$OPTARG ;; c) crop=$OPTARG ;; s) wait=$OPTARG ;;
     e) envs="$envs $OPTARG" ;; b) bin=$OPTARG ;;
-    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
 done
 shift $((OPTIND - 1))
@@ -43,12 +45,23 @@ fi
 
 # a throwaway config folder, so saved preferences never change the picture
 cfg=${PUTIACNC_CONFIG_DIR:-$(mktemp -d)}
-[ -n "$PUTIACNC_CONFIG_DIR" ] || trap 'rm -rf "$cfg"' EXIT
+tmpcfg=""; [ -n "$PUTIACNC_CONFIG_DIR" ] || tmpcfg=$cfg
+# the app's output goes to a log that is shown when something goes wrong
+log=$(mktemp)
+trap 'rm -rf "$log" $tmpcfg' EXIT
+fail() { echo "error: $1. No picture written. The program's last output:" >&2; tail -n 15 "$log" >&2; rm -f "$out"; exit 1; }
 
+# never leave an old picture behind that could pass for this run's
+rm -f "$out"
 # shellcheck disable=SC2086
-env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE DISPLAY="$vd" WINIT_UNIX_BACKEND=x11 PUTIACNC_CONFIG_DIR="$cfg" PUTIACNC_SKIP_SETUP=${PUTIACNC_SKIP_SETUP-1} PUTIACNC_THEME="$theme" PUTIACNC_WIN="$win" $envs "$bin" $proj >/dev/null 2>&1 &
+env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE DISPLAY="$vd" WINIT_UNIX_BACKEND=x11 PUTIACNC_CONFIG_DIR="$cfg" PUTIACNC_SKIP_SETUP=${PUTIACNC_SKIP_SETUP-1} PUTIACNC_THEME="$theme" PUTIACNC_WIN="$win" $envs "$bin" $proj >"$log" 2>&1 &
 pid=$!
 sleep "$wait"
+# a program that crashed at start (missing library, panic) is an error, not a black picture
+if ! kill -0 $pid 2>/dev/null; then
+  code=0; wait $pid || code=$?
+  fail "$bin exited (code $code) before the picture was taken"
+fi
 if [ -n "$crop" ]; then
   IFS=, read -r x y w h <<EOF
 $crop
@@ -59,4 +72,8 @@ else
 fi
 kill $pid 2>/dev/null || true
 wait $pid 2>/dev/null || true
+# a whole screen of one colour means the window never drew (a crop of plain background may be one colour, so not checked)
+if [ -z "$crop" ] && [ "$(convert "$out" -format %k info:)" -le 1 ]; then
+  fail "the picture is a single colour: the window never drew"
+fi
 echo "$out"

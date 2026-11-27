@@ -40,7 +40,8 @@ Anything that decides something should be testable without a window. See `ARCHIT
 ## Looking at the window without a screen
 
 `scripts/shot.sh` starts a virtual screen (once), opens the app in a given state in a throwaway config folder, waits,
-takes the picture and closes the app. It needs `xvfb` and `imagemagick`, and a built `putiacnc`
+takes the picture and closes the app. If the app dies first, or the whole screen is one colour, it exits 1, writes
+no picture and prints the app's last output. It needs `xvfb` and `imagemagick`, and a built `putiacnc`
 (`cargo build -p putiacnc-gui`).
 
 ```

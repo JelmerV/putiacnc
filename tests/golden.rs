@@ -3,8 +3,9 @@
 //! `NAME.project.json` is the input, `NAME.snapshot.nc` the reviewed G-code, `NAME.snapshot.json` holds the units and
 //! the time estimate. When the generator changes on purpose, run
 //! `UPDATE_SNAPSHOTS=1 cargo test --test golden`, look at `git diff tests/data` and commit what you accept.
-//! Coordinates are compared with a tolerance (not byte for byte) because trig functions differ in the last digits
-//! between platforms; everything else (line count, words, feeds) must match exactly.
+//! The text is first compared byte for byte, which is fast and what normally happens. Only when that fails are
+//! coordinates compared with a tolerance, because trig functions can differ in the last digits between platforms;
+//! everything else (line count, words, feeds) must still match exactly.
 use putiacnc_core::{generate, load_project, Units};
 use std::fs;
 use std::path::PathBuf;
@@ -24,11 +25,20 @@ fn check(name: &str, units: Units) {
         return;
     }
     let want = fs::read_to_string(&nc).unwrap_or_else(|_| panic!("{name}: no snapshot; run with UPDATE_SNAPSHOTS=1"));
+    if got != want { compare_with_tolerance(name, units, &out.lines, &want); }
+    let m: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+    let want_s = m["time_s"].as_f64().unwrap();
+    let got_s = out.time_min * 60.0;
+    assert!((want_s - got_s).abs() <= 0.5 + want_s * 0.001, "{name}: time {got_s:.1}s vs {want_s:.1}s");
+}
+
+/// The fallback when the text is not byte-identical: same lines and words, XYZ on motion lines within rounding.
+fn compare_with_tolerance(name: &str, units: Units, lines: &[String], want: &str) {
     let exp: Vec<&str> = want.split('\n').collect();
-    assert_eq!(out.lines.len(), exp.len(), "{name}: line count");
+    assert_eq!(lines.len(), exp.len(), "{name}: line count");
     // 0.0011 mm: coordinates are printed with 3 decimals (4 in inches), so a last-digit rounding flip is the largest legitimate difference
     let tol = 0.0011 / units.factor();
-    for (i, (a, b)) in exp.iter().zip(out.lines.iter()).enumerate() {
+    for (i, (a, b)) in exp.iter().zip(lines.iter()).enumerate() {
         let (ta, tb): (Vec<&str>, Vec<&str>) = (a.split(' ').collect(), b.split(' ').collect());
         assert_eq!(ta.len(), tb.len(), "{name} line {i}: `{a}` vs `{b}`");
         let motion = a.starts_with("G0") || a.starts_with("G1");
@@ -41,10 +51,19 @@ fn check(name: &str, units: Units) {
             }
         }
     }
-    let m: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
-    let want_s = m["time_s"].as_f64().unwrap();
-    let got_s = out.time_min * 60.0;
-    assert!((want_s - got_s).abs() <= 0.5 + want_s * 0.001, "{name}: time {got_s:.1}s vs {want_s:.1}s");
+}
+
+/// The fallback is only reached when the bytes differ, so it gets its own cases: a last-digit flip passes...
+#[test] fn fallback_accepts_a_rounding_flip() {
+    compare_with_tolerance("flip", Units::Metric, &["G21".into(), "G1 X10.001 Y5 F800".into()], "G21\nG1 X10.002 Y5 F800");
+}
+/// ...a real move change does not,
+#[test] #[should_panic(expected = "line 1")] fn fallback_rejects_a_moved_point() {
+    compare_with_tolerance("moved", Units::Metric, &["G21".into(), "G1 X10.000 Y5 F800".into()], "G21\nG1 X10.002 Y5 F800");
+}
+/// ...and nothing but coordinates gets a tolerance.
+#[test] #[should_panic(expected = "line 0")] fn fallback_is_exact_outside_coordinates() {
+    compare_with_tolerance("feed", Units::Metric, &["G1 X10 F801".into()], "G1 X10 F800");
 }
 
 #[test] fn outside_ramp() { check("outside_ramp", Units::Metric); }

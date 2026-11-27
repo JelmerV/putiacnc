@@ -10,7 +10,7 @@ Needs Rust 1.89+ (`rust-version` in `Cargo.toml`) and a C++ compiler (`clipper-s
 On Linux the GUI also needs the window libraries CI installs:
 `libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev`.
 To *run* the GUI (screenshots under Xvfb) it also needs `libxkbcommon-x11-0`; without it the app panics at start
-with "Library libxkbcommon-x11.so could not be loaded" and `scripts/shot.sh` silently writes a black picture.
+with "Library libxkbcommon-x11.so could not be loaded" (`scripts/shot.sh` then fails and prints that output).
 
 ```bash
 cargo test --workspace
@@ -52,6 +52,7 @@ Test efficiently, but to the level a user would hit it. In this order:
    `note:` lines, not just that a file appeared.
 3. **UI**: build the app (`cargo build -p putiacnc-gui`) and look at the affected window with `scripts/shot.sh`
    (Xvfb + ImageMagick, no screen needed; see `docs/testing.md` for options and `PUTIACNC_*` variables). Open the
-   screenshot and check it. Use `scripts/shot-sweep.py` when a change touches many windows.
+   screenshot and check it. `shot.sh` exits non-zero and writes no picture when the app dies or the window never
+   draws, so a missing picture is a failure, never a pass. Use `scripts/shot-sweep.py` when a change touches many windows.
 
 Report what was run and what was seen; say plainly if a step was skipped.
