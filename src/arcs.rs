@@ -8,8 +8,8 @@
 //! one circle within a very small tolerance AND each straight piece is already a fine approximation of that circle, so a coarse
 //! polygon (a hexagon, say) is never turned into a circle.
 
-/// Points must lie this close to the fitted circle (mm).
-const ON_CIRCLE: f64 = 0.005;
+/// Points must lie this close to the fitted circle (mm). The motion cross-check (`crosscheck`) allows the same.
+pub const ON_CIRCLE: f64 = 0.005;
 /// Largest gap between a straight piece and the circle it stands for (mm): the app draws circles with short chords, so this lets a
 /// drawn circle become an arc while a deliberate polygon stays straight.
 const MAX_SAGITTA: f64 = 0.12;

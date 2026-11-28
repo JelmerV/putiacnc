@@ -140,11 +140,32 @@ pub struct ToolRef {
     pub id: String,
     /// The tool's name as the user typed it (a post makes it plain ASCII for a comment with the `comment` filter).
     pub name: String,
-    /// The tool number a post writes (`T#`): the order of first use in the program (phase 3: the machine's tool table).
-    pub number: u32,
-    pub length_offset: Option<u32>,
+    /// The tool number a post writes (`T#`, `{tool.number}`), resolved by `toolnum::resolve`: the machine's tool table, the tool's
+    /// own number, or the order of first use.
+    pub number: u16,
+    /// The length offset register (`H#`, `{tool.offset}`); `None` = the number (the generator always sets it).
+    pub length_offset: Option<u16>,
+    /// Where `number` came from (the setup sheet lists rack slots).
+    pub from: NumberFrom,
     pub dia: f64,
     pub shape: String,
+}
+
+impl ToolRef {
+    /// The length offset register: `length_offset`, or the tool number.
+    pub fn offset(&self) -> u16 { self.length_offset.unwrap_or(self.number) }
+}
+
+/// Where a tool's number came from (`toolnum::resolve`), first match wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NumberFrom {
+    /// The machine's tool table (`Machine.tool_table`): a rack slot.
+    Rack,
+    /// The tool's own number (`Tool.number`).
+    Tool,
+    /// The order of first use in this program (only for posts with `tool_numbers = "first_use"`).
+    #[default]
+    FirstUse,
 }
 
 /// A target position: each axis given or not. Not given = not written (unchanged). Stored as three numbers and a mask, so that
@@ -173,6 +194,8 @@ impl Xyz {
     pub fn y(&self) -> Option<f64> { self.get(1) }
     pub fn z(&self) -> Option<f64> { self.get(2) }
     pub fn is_empty(&self) -> bool { self.set == 0 }
+    /// The axes given (bit 0 X, 1 Y, 2 Z).
+    pub fn mask(&self) -> u8 { self.set }
 }
 
 impl std::fmt::Debug for Xyz {
@@ -208,7 +231,7 @@ mod tests {
 
     #[test]
     fn what_halts_the_machine() {
-        let tool = Event::ToolChange { tool: Box::new(ToolRef { id: "t".into(), name: "6 mm".into(), number: 1, length_offset: None, dia: 6.0, shape: "flat".into() }) };
+        let tool = Event::ToolChange { tool: Box::new(ToolRef { id: "t".into(), name: "6 mm".into(), number: 1, length_offset: None, from: NumberFrom::FirstUse, dia: 6.0, shape: "flat".into() }) };
         for e in [Event::SpindleOn { rpm: 1000.0 }, Event::SpindleOff, Event::Dwell { seconds: 2.0, why: DwellWhy::SpinUp }, Event::Dwell { seconds: 0.1, why: DwellWhy::Requested },
                   Event::Stop { message: "x".into(), optional: false }] {
             assert!(e.halts(false) && e.halts(true), "{e:?}");

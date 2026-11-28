@@ -44,8 +44,8 @@ A G-code file over 1 MB would be stored as `<name>.nc.digest` instead (SHA-256, 
 The matrix puts the same fixed machine on every project, and none of the projects above pauses, draws with a pen or
 uses some of the other operations, so parts of the emitter never show in it. A short list of explicit cases in
 `tests/golden.rs` (`cases()`) covers them, each in its own directory and with the same file names. They were
-added before phase 1 of the spec (the emitter refactor), from the unchanged generator. Every case runs in all 5
-dialects, metric, arcs off, unless the table says otherwise; each also writes the per-tool files when it has more
+added before phase 1 of the spec (the emitter refactor), from the unchanged generator; the two `rack` cases came with
+phase 3. Every case runs in all 5 dialects, metric, arcs off, unless the table says otherwise; each also writes the per-tool files when it has more
 than one tool.
 
 | Directory | Project | What it covers |
@@ -62,6 +62,8 @@ than one tool.
 | `trochoidal/` | `tests/data/pocket_island.project.json` with trochoidal clearing, as `tests/trochoidal.rs` sets it | with arcs off, only the loops are fitted as G2/G3 (the per-range fitter) |
 | `photo-vcarve/` | a gradient picture, as `tests/photo_vcarve.rs` makes it | photo V-carve |
 | `plug-piece/` | an inlay with its plug on a separate 8 mm piece, as the tests in `src/pieces.rs` make it | the `-plug` file of `pieces::generate_parts` |
+| `rack/` | `tests/data/rack_two_tools.project.json`: the two-tool job of `two_ops_toolchange` on a Mach3 / LinuxCNC machine whose tool rack (`toolTable`) has the 1/8" end mill in slot 5 and the 6 mm end mill in slot 7. **Mach3 / LinuxCNC only** (the one built-in that writes tool numbers) | phase 3: `T5 M6` / `T7 M6` from the rack, also in each per-tool file |
+| `rack-first-use/` | the same project without its rack, the 6 mm end mill numbered 1 on the tool itself. **Mach3 / LinuxCNC only** | phase 3: the 1/8" end mill, used first, is numbered by first use and skips the taken 1 (`T2 M6`, then `T1 M6`); in its own per-tool file it is `T1` (each file is numbered on its own) |
 
 The small two-tool job is made in code (`small_job`): a 60 x 40 x 6 mm stock, a 3 mm cutter round a 15 x 10 mm
 rectangle, then a 6 mm cutter inside a 16 mm circle, 1 mm deep in one pass, no ramp. The relief detail pass (the

@@ -99,7 +99,7 @@ Design rules:
 - **Arcs are fitted on the IR**, not on text. The post engine fits runs of `Feed` events (`arcs::fit_items`) on the numbers the post writes (output units, rounded by its X/Y format), before it renders, and writes each arc through `on_circular`; `caps.arcs = none` fits nothing. Since phase 2 this is the only fitter in use; `arcs::fit_arcs` is a thin wrapper that reads text into the same items, and a test compares the two on every golden program.
 - **Times stay with the generator.** The `Move` list and time estimate are built from the IR, so they do not depend on the post.
 
-**As built (phases 1 and 2).** `src/program.rs` differs from the sketch above where today's output needed it (details in `docs/implementation-log.md`): an `Event::Setup` for the setup block (`on_open`); `OperationStart { index, name }` (name = the operation's kind) and `OperationEnd { index }`, while the operation's description stays `Comment` events; `ToolChange { tool }` without `next` (the engine finds the next tool); `SpindleOn { rpm }` without a direction; `Feed { to, feed, write_feed }` without `kind`, where `write_feed` gives the feed the way `to` gives axes (the generator's modal rule); `Arc(Box<ArcTo>)` (boxed, so an event stays 48 bytes; the generator writes none yet); `ToolRef.number` is a `u32`, the order of first use until phase 3; `Xyz` is three numbers and a mask. `Meta` holds the units, the resolved work offset, and, until phase 4a makes them properties, `numbered`, `arcs`, `start_code`, `end_code`, `start_at` and the trochoidal ranges. A requested dwell is rounded to 0.01 s by the generator (a value, not a format).
+**As built (phases 1 and 2).** `src/program.rs` differs from the sketch above where today's output needed it (details in `docs/implementation-log.md`): an `Event::Setup` for the setup block (`on_open`); `OperationStart { index, name }` (name = the operation's kind) and `OperationEnd { index }`, while the operation's description stays `Comment` events; `ToolChange { tool }` without `next` (the engine finds the next tool); `SpindleOn { rpm }` without a direction; `Feed { to, feed, write_feed }` without `kind`, where `write_feed` gives the feed the way `to` gives axes (the generator's modal rule); `Arc(Box<ArcTo>)` (boxed, so an event stays 48 bytes; the generator writes none yet); `ToolRef.number` is a `u16` and `length_offset` an `Option<u16>` since phase 3 (resolved from the machine's tool table, the tool or the order of first use; `ToolRef.from` says which); `Xyz` is three numbers and a mask. `Meta` holds the units, the resolved work offset, and, until phase 4a makes them properties, `numbered`, `arcs`, `start_code`, `end_code`, `start_at` and the trochoidal ranges. A requested dwell is rounded to 0.01 s by the generator (a value, not a format).
 
 ## Post-processor interface
 
@@ -111,12 +111,14 @@ pub trait Post: Send + Sync {
     fn caps(&self) -> &Caps;
     fn properties(&self) -> &[PropDef];     // user options, Fusion-style
     fn render(&self, prog: &Program, ctx: &PostCtx) -> Result<Rendered, PostError>;
+    fn read_back(&self, units: Units) -> verify::ReadBack;  // phase 3: how verify reads the text (plain data)
 }
 
 pub struct Caps {
     pub arcs: ArcSupport,          // None | Xy | Helical
     pub max_arc_sweep: f64,        // degrees; longer arcs are split (Fusion: maximumCircularSweep)
     pub tool_change: ToolChange,   // Manual (stop + message) | Atc
+    pub tool_numbers: ToolNumbers, // FirstUse | Required (phase 3; default Required with Atc, FirstUse with Manual)
     pub length_offset: bool,       // writes G43 H# itself
     pub spindle: SpindleCtl,       // Controlled | Manual (operator starts it)
     pub dwell: DwellUnit,          // Seconds | Milliseconds | None (controller waits)
@@ -153,8 +155,10 @@ One engine implements the trait: it loads a post package (manifest, templates, o
 | --- | --- |
 | `arcs = None` | No arc fitting; trochoidal loops stay as short lines with a warning (the post engine fits, so the post writes the note) |
 | `tool_change = Manual` | Emits a `Stop` with the "change tool, touch off Z0" message before `ToolChange` (today's GRBL behaviour) |
-| `tool_change = Atc` | No stop, and the machine stands still at the `ToolChange` (`Move.stop`; Mach3 / LinuxCNC today). Phase 3: requires every used tool to have a number, else an export error |
-| `length_offset = false` with `Atc` | Phase 3: warning "every tool after the first relies on the controller's own length handling" (not for the built-in Mach3 / LinuxCNC, whose notes must not change) |
+| `tool_change = Atc` | No stop, and the machine stands still at the `ToolChange` (`Move.stop`; Mach3 / LinuxCNC today). The ATC checks run on the final text (Verification, item 3) |
+| `tool_numbers = Required` (default with `Atc`) | Every used tool must have a number (rack slot or `Tool.number`), else an export error naming each tool without one |
+| `tool_numbers = FirstUse` (default with `Manual`; the built-in Mach3 / LinuxCNC) | A tool without a rack slot or number of its own is numbered by order of first use, skipping the numbers the program's numbered tools have |
+| `length_offset = false` with `Atc` and `Required` | Warning "every tool after the first relies on the controller's own tool length handling" (not with `FirstUse`: the built-in Mach3 / LinuxCNC, whose notes must not change) |
 | `spindle = Manual` | `SpindleOn` becomes a `Stop` asking the operator, no `SpindleOff` and no spin-up `Dwell`; the tool-change and pause messages start "Stop the spindle", the end is a stop "Stop the spindle, then resume" (today's Marlin behaviour). A requested `Dwell` (a pen's) stays |
 | `dwell = None` | No spin-up `Dwell` events |
 | `wcs_count` | The work offset: the job's choice when the controller has it, else G54 |
@@ -314,13 +318,13 @@ pub struct ToolSlot { pub tool_id: String, pub number: u16, pub length_offset: O
 
 **Resolving a tool's number** at generate time, first match wins:
 
-1. The machine's `tool_table` entry for that tool id.
+1. The machine's `tool_table` entry for that tool id (the generator reads the project's copy of the machine, `ProjectData.machine`).
 2. The tool's own `number`.
-3. Order of first use (today's behaviour), only for posts with `tool_change = Manual`.
+3. Order of first use (today's behaviour), only for posts with `tool_numbers = "first_use"`. These numbers skip every number already taken in this program by a tool resolved in steps 1 and 2.
 
-With an ATC post, a used tool that resolves to step 3 is an export error naming the tool, and two tools resolving to the same number is an error too. Loading the wrong cutter is worse than not exporting.
+The capability `tool_numbers` (`[caps]`) decides step 3: `"required"` (the default with `tool_change = "atc"`) makes a used tool that resolves to step 3 an export error naming each such tool; `"first_use"` (the default with `"manual"`) numbers it. The built-in Mach3 / LinuxCNC is an ATC post that sets `"first_use"`, so its output does not change. Two different used tools resolving to the same number is an error with every post. Loading the wrong cutter is worse than not exporting.
 
-`length_offset` defaults to the resolved number (`H5` (offset register) for `T5` (tool number)), which is the usual Fanuc/Mach convention and what the TX-35 post expects.
+`length_offset` defaults to the resolved number (`H5` (offset register) for `T5` (tool number)), which is the usual Fanuc/Mach convention and what the TX-35 post expects. As built: the rack entry's `length_offset` when the number came from the rack, else the tool's own `length_offset`, else the number. The numbers are resolved once the generator has walked every operation (`src/toolnum.rs`), because the skip in step 3 needs every tool the program uses; each file of a split program is resolved on its own.
 
 **UI:** the machine manager gets a "Tool rack" tab listing slots with a tool picker per slot; the tool manager shows each tool's slot on the selected machine. The setup sheet lists slot and H number per tool, so the operator can check the rack before pressing start.
 
@@ -359,12 +363,12 @@ The second command lints a post and prints the rendered test program, for use in
 The refactor touches the code that decides where a spinning cutter goes, so every phase has a test gate.
 
 1. **Golden files (phase 0, before any refactor).** Generate G-code for every project in `examples/` and the built-in samples, in every built-in dialect, and commit the output under `tests/golden/`. A test regenerates and compares byte for byte. Refactors are free, but any golden change needs a reviewed reason in the commit.
-2. **Independent read-back.** `verify` keeps parsing the *final* text, not the IR. It becomes dialect-aware by reading the post's `[words]` and `[modal]` tables, and gains a cross-check: the parsed motion must match the IR's motion within 0.001 mm. A post that drops, reorders or mis-scales a move fails export.
+2. **Independent read-back.** `verify` keeps parsing the *final* text, not the IR. It becomes dialect-aware through a small read-only description built from the package (`verify::ReadBack`: comment style, I/J incremental, line numbers, motion codes always or modal, dwell unit, decimals of the axes, which tool numbers are pens), passed in as plain data, and gains a cross-check: the parsed motion must match the IR's motion events in order (`Rapid`, `Feed`, `Arc`, the first lift and the `ProgramEnd` park), paired by order and never through the source map. Tolerance (phase 3): half a unit of the output's last decimal, in mm, plus 1e-9 (0.0005 mm for 3 decimals; 0.0254 × 0.5 × 10⁻⁴ mm for 4-decimal inches); a fitted arc must end within that, with every point of the run it replaces within the fitter's tolerance (`arcs::ON_CIRCLE`, 0.005 mm) plus the rounding of the point, start and centre. A post that drops, reorders or mis-scales a move fails export, naming the line, its text and the expected position.
 3. **ATC safety checks** on the final text when `tool_change = atc`:
-   - the spindle is stopped (`M5`, spindle stop) before every `M6` (tool change) when the stop property is on;
+   - the spindle is stopped (`M5`, spindle stop) before every `M6` (tool change) when the stop property is on (the well-known property name `stop_spindle_before_tool_change`, read from `PostCtx.props`, else the package's default);
    - every `M6` (tool change) is followed by a length offset before the first Z move, when `length_offset = true`;
    - the spindle is running before every cutting move;
-   - every T number matches the resolved rack slot of the tool the IR says is cutting.
+   - every T number matches the resolved rack slot of the tool the IR says is cutting (as built: the `T` in effect at the k-th `M6` is the k-th `ToolChange`'s number, the number of `M6` equals the number of `ToolChange` events, and every `T` word is one of the program's tools, which leaves room for a pre-selected next tool).
 4. **Post engine tests.** Each handler, modal group, word format, `?property:` line and Rhai helper has a unit test. The TX-35 package rendered for a fixed two-tool project is compared with a VCarve file for the same job; the only allowed differences are `M5` (spindle stop) before `M06` (tool change) and the first-tool ordering. The original VCarve post is committed as a fixture.
 5. **Sandbox tests.** A Rhai handler cannot open files, reach the network or loop forever; each case has a test.
 6. **On the machine.** Before the TX-35 post is called done: an air cut 20 mm above the stock with offsets active, then a two-tool job on scrap, checking depth after the tool change.

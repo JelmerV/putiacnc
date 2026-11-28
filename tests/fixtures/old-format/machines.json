@@ -1,0 +1,44 @@
+{
+  "v": 1,
+  "def": "m1",
+  "list": [
+    {
+      "id": "m1",
+      "name": "My CNC machine",
+      "rapid": 2000.0,
+      "tsc": 1.2,
+      "x": 300.0,
+      "y": 200.0,
+      "z": 60.0,
+      "notes": "",
+      "post": "mach",
+      "numbered": false,
+      "safe": 5.0,
+      "spinUp": 2.0,
+      "inches": false,
+      "arcs": false,
+      "startCode": "M8",
+      "holder": 30.0,
+      "accel": 500.0
+    },
+    {
+      "id": "m2",
+      "name": "Second",
+      "rapid": 2000.0,
+      "tsc": 1.2,
+      "x": 300.0,
+      "y": 200.0,
+      "z": 60.0,
+      "notes": "",
+      "numbered": false,
+      "safe": 5.0,
+      "spinUp": 2.0,
+      "inches": false,
+      "arcs": false,
+      "startCode": "M8",
+      "holder": 30.0,
+      "accel": 500.0,
+      "rigid": "heavy"
+    }
+  ]
+}

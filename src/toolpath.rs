@@ -3,8 +3,8 @@
 use crate::i18n::{tr, tr_f, tr_n, tr_nf};
 use crate::clip::{self, Path};
 use crate::model::*;
-use crate::program::{CommentKind, DwellWhy, Event, Meta, Program, ToolRef, Xyz};
-use crate::post::{DwellUnit, Post, PostCtx, SpindleCtl};
+use crate::program::{CommentKind, DwellWhy, Event, Meta, NumberFrom, Program, ToolRef, Xyz};
+use crate::post::{DwellUnit, Post, PostCtx, PropValue, SpindleCtl, ToolChangeMode, ToolNumbers};
 pub use crate::post::{number_lines, stop_message};
 
 const S: f64 = 1000.0;
@@ -240,6 +240,8 @@ struct Em {
     manual_spindle: bool,
     /// `caps.tool_change = atc`: the controller changes the tool itself (no stop for the operator), and the machine stands still there.
     atc: bool,
+    /// The tools the program changes to, in order of first use (each once): their numbers are resolved after the walk (`toolnum`).
+    used: Vec<Tool>,
 }
 
 impl Em {
@@ -308,9 +310,12 @@ impl Em {
         let Event::OperationStart { index, .. } = self.ev[i] else { return };
         if i + 1 == self.ev.len() { self.ev.pop(); } else { self.ev.push(Event::OperationEnd { index }); }
     }
-    /// This tool is in the spindle from here on.
+    /// This tool is in the spindle from here on. Its number is the order of first use for now; `generate` resolves the numbers of all
+    /// the tools once the program is complete (first-use numbers skip the numbers of tools used later).
     fn tool_change(&mut self, tool: &Tool, number: usize) {
-        self.ev.push(Event::ToolChange { tool: Box::new(ToolRef { id: tool.id.clone(), name: tool.name.clone(), number: number as u32, length_offset: None, dia: tool.dia, shape: tool.shape.clone() }) });
+        if !self.used.iter().any(|t| t.id == tool.id) { self.used.push(tool.clone()); }
+        self.ev.push(Event::ToolChange { tool: Box::new(ToolRef { id: tool.id.clone(), name: tool.name.clone(), number: number.min(u16::MAX as usize) as u16, length_offset: None,
+                                                                  from: NumberFrom::FirstUse, dia: tool.dia, shape: tool.shape.clone() }) });
     }
 }
 
@@ -1739,6 +1744,12 @@ fn photo_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &Project
 }
 
 pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
+    generate_with(data, units, crate::post::for_job(&data.job), &std::collections::BTreeMap::new())
+}
+
+/// `generate` with a given post and its property values (`PostCtx.props`): for posts that are not the job's built-in (phase 4a reads
+/// the machine's post) and for tests.
+pub fn generate_with(data: &ProjectData, units: Units, post: &dyn Post, props: &std::collections::BTreeMap<String, PropValue>) -> Result<Output, String> {
     sanity(data)?;
     let ku = units.factor();
     let un = units.name();
@@ -1772,10 +1783,9 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
     let (ox, oy) = zero_offsets(st);
     let zt = if st.zm == "top" { 0.0 } else { st.t - st.zh };
     // what the controller can do decides what is emitted; the post writes the text at the end
-    let post = crate::post::for_job(&data.job);
     let caps = post.caps();
     let manual_spindle = caps.spindle == SpindleCtl::Manual;
-    let mut e = Em { ev: vec![], cur: [ox, oy, sz_init], lf: None, time: 0.0, tc: 0.0, pn: 0, oi: 0, lap: false, pw: None, last_ring: None, link_ok: false, troch: vec![], moves: vec![], last_ev: 0, alt: false, det: false, marks: vec![], lead_skipped: 0, helix_skipped: 0, ox, oy, zt, ku, imp, rap: machine.rapid, tsc: machine.tsc, spin: if manual_spindle || caps.dwell == DwellUnit::None { 0.0 } else { machine.spin_up_s() }, rates: machine.rates(), capped: 0, manual_spindle, atc: caps.tool_change_halts() };
+    let mut e = Em { ev: vec![], cur: [ox, oy, sz_init], lf: None, time: 0.0, tc: 0.0, pn: 0, oi: 0, lap: false, pw: None, last_ring: None, link_ok: false, troch: vec![], moves: vec![], last_ev: 0, alt: false, det: false, marks: vec![], lead_skipped: 0, helix_skipped: 0, ox, oy, zt, ku, imp, rap: machine.rapid, tsc: machine.tsc, spin: if manual_spindle || caps.dwell == DwellUnit::None { 0.0 } else { machine.spin_up_s() }, rates: machine.rates(), capped: 0, manual_spindle, atc: caps.tool_change_halts(), used: vec![] };
     let mut notes: Vec<String> = limit_notes;
 
     if data.loops.iter().filter(|l| !data.ops.iter().any(|o| o.id == l.op && o.p.surf)).any(|l| l.pts.chunks_exact(2).any(|p| (p[0] as f64) < 0.0 || (p[1] as f64) < 0.0 || (p[0] as f64) > st.w * S || (p[1] as f64) > st.h * S)) {
@@ -2243,6 +2253,19 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
     }
     if ts.spun && e.manual_spindle { e.stop("Stop the spindle, then resume"); } else if ts.spun { e.ev.push(Event::SpindleOff); }
     e.ev.push(Event::ProgramEnd { park: Some(Xyz::new(Some(0.0), Some(0.0), None)) });
+    // tool numbers and length offsets: the machine's rack, the tool's own number, or the order of first use (`toolnum`)
+    let used: Vec<&Tool> = e.used.iter().collect();
+    let nums = crate::toolnum::resolve(&used, &machine, caps.tool_numbers)?;
+    for ev in e.ev.iter_mut() {
+        if let Event::ToolChange { tool } = ev {
+            if let Some(r) = e.used.iter().position(|t| t.id == tool.id).map(|i| nums[i]) {
+                tool.number = r.number; tool.length_offset = Some(r.offset); tool.from = r.from;
+            }
+        }
+    }
+    if caps.tool_change == ToolChangeMode::Atc && !caps.length_offset && caps.tool_numbers == ToolNumbers::Required && used.len() > 1 {
+        notes.push(tr("This post writes no length offsets (G43 H): every tool after the first relies on the controller's own tool length handling.").into());
+    }
     let cut_len: f64 = e.moves.iter().filter(|m| m.cut).map(|m| ((m.to[0] - m.from[0]).powi(2) + (m.to[1] - m.from[1]).powi(2) + (m.to[2] - m.from[2]).powi(2)).sqrt()).sum();
     let program = Program {
         meta: Meta { units, wcs: caps.wcs_name(data.job.wcs), numbered: data.job.numbered, arcs: machine.arcs == Some(true),
@@ -2250,8 +2273,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
         events: std::mem::take(&mut e.ev),
     };
     // the text: arcs (the trochoidal loops always), the events, the machine's own start and end lines, line numbers
-    let props = std::collections::BTreeMap::new();
-    let r = post.render(&program, &PostCtx { machine: &machine, props: &props, safe_z: data.job.safe }).map_err(|e| e.to_string())?;
+    let r = post.render(&program, &PostCtx { machine: &machine, props, safe_z: data.job.safe }).map_err(|e| e.to_string())?;
     if r.troch_arcs > 0 { notes.push(tr_f("Trochoidal loops written as {n} G2/G3 arcs: run an air cut first if this machine has not done arcs before.", &[("n", &r.troch_arcs)])); }
     if r.arcs > 0 { notes.push(tr_n(r.arcs as u64, "{n} arc written as G2/G3: shorter file; run an air cut first if this machine has not done arcs before.", "{n} arcs written as G2/G3: shorter file; run an air cut first if this machine has not done arcs before.")); }
     notes.extend(r.notes.iter().cloned());
@@ -2260,10 +2282,11 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
         notes.push(tr_f("{machine}: {start} and {end} of your own G-code added; the time estimate does not include any moves in them.", &[("machine", &machine.name),
             ("start", &tr_n(start_code.len() as u64, "{n} start line", "{n} start lines")), ("end", &tr_n(end_code.len() as u64, "{n} end line", "{n} end lines"))]));
     }
-    let lines = r.lines;
+    let (lines, source) = (r.lines, r.source);
     if e.capped > 0 { notes.push(tr_n(e.capped as u64, "{n} cutting move asked for more than the machine's top speed on an axis; the time estimate holds it down to it, as the controller does.", "{n} cutting moves asked for more than the machine's top speed on an axis; the time estimate holds them down to it, as the controller does.")); }
-    // last of all, the text itself is read back by a checker that shares nothing with the code above
-    notes.extend(crate::verify::hazards(&lines));
+    // last of all, the text itself is read back by a checker that shares nothing with the code above: its hazards are notes, and its
+    // moves must be the program's (the cross-check), and on a tool changer its tool changes safe (the ATC checks); those stop the export
+    notes.extend(read_back(&program, &lines, &source, post, props, units)?);
     // with an acceleration set, the moves take what the machine really needs (the waits for the spindle stay as they were)
     if let Some(m) = machine.motion() {
         let before: f64 = e.moves.iter().map(|mv| mv.dt).sum();
@@ -2272,6 +2295,32 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
         e.tc = e.moves.iter().filter(|mv| mv.cut).map(|mv| mv.dt).sum();
     }
     Ok(Output { lines, program, moves: e.moves, time_min: e.time, cut_time_min: e.tc, cut_len_mm: cut_len, notes, tab_marks: e.marks })
+}
+
+/// The final text read back by `verify` (which knows only the post's [`crate::verify::ReadBack`]): the hazards as notes, then the motion
+/// cross-check against the program's events (`crosscheck`) and, for a tool-changer post, the ATC checks, all in one pass. A
+/// cross-check or ATC failure is the error.
+fn read_back(program: &Program, lines: &[String], source: &[Option<usize>], post: &dyn Post, props: &std::collections::BTreeMap<String, PropValue>, units: Units) -> Result<Vec<String>, String> {
+    let caps = post.caps();
+    let mut rb = post.read_back(units);
+    rb.numbered = program.meta.numbered;
+    let tools: Vec<&ToolRef> = program.events.iter().filter_map(|e| match e { Event::ToolChange { tool } => Some(&**tool), _ => None }).collect();
+    rb.pens = tools.iter().filter(|t| t.shape == "pen").map(|t| t.number).collect();
+    let mut cc = crate::crosscheck::Checker::new(&program.events, source, &rb, crate::crosscheck::Tol::new(&rb, units.factor()));
+    let mut atc = (caps.tool_change == ToolChangeMode::Atc).then(|| crate::verify::AtcCheck::new(crate::verify::AtcExpect {
+        stop_before_change: crate::post::bool_prop(post, props, crate::post::STOP_SPINDLE_BEFORE_TOOL_CHANGE),
+        length_offset: caps.length_offset,
+        tools: tools.iter().map(|t| (t.number, t.offset())).collect(),
+    }));
+    let trace = crate::verify::read(lines, &rb, &mut |f| { cc.fact(f); if let Some(a) = atc.as_mut() { a.fact(f); } });
+    let machine_moves = cc.machine_moves;
+    cc.finish()?;
+    if let Some(a) = atc { a.finish()?; }
+    let mut notes = trace.hazards;
+    if machine_moves > 0 {
+        notes.push(tr_n(machine_moves as u64, "The machine's own start or end code has {n} move: it is not checked against the toolpath; make sure it is safe.", "The machine's own start or end code has {n} moves: they are not checked against the toolpath; make sure they are safe."));
+    }
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -2394,7 +2443,7 @@ mod tests {
 
     #[test]
     fn cone_radius_grows_with_depth() {
-        let t = Tool { id: "t".into(), name: "v".into(), sys: "mm".into(), shape: "vbit".into(), angle: 90.0, flutes: 2, dia: 6.0, rpm: 1.0, feed: 1.0, plunge: 1.0, so: 40.0, pd: 1.0, notes: String::new(), tip: 0.0, arc: 0.0, concave: false, flute: 0.0, shank: 0.0, stick: 0.0, color: None };
+        let t = Tool { id: "t".into(), name: "v".into(), sys: "mm".into(), shape: "vbit".into(), angle: 90.0, flutes: 2, dia: 6.0, rpm: 1.0, feed: 1.0, plunge: 1.0, so: 40.0, pd: 1.0, notes: String::new(), tip: 0.0, arc: 0.0, concave: false, flute: 0.0, shank: 0.0, stick: 0.0, color: None, number: None, length_offset: None };
         let g = ToolGeo::new(&t);
         assert!((g.r_at(1.5) - 1.5).abs() < 1e-9);
         assert!((g.r_at(10.0) - 3.0).abs() < 1e-9);

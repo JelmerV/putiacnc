@@ -127,7 +127,7 @@ mod tests {
     use super::*;
 
     fn tool(shape: &str, dia: f64, flutes: u32, rpm: f64) -> Tool {
-        Tool { id: "t".into(), name: "t".into(), sys: "mm".into(), shape: shape.into(), angle: 60.0, flutes, dia, rpm, feed: 800.0, plunge: 250.0, so: 40.0, pd: 1.0, notes: String::new(), tip: 0.0, arc: 0.0, concave: false, flute: 0.0, shank: 0.0, stick: 0.0, color: None }
+        Tool { id: "t".into(), name: "t".into(), sys: "mm".into(), shape: shape.into(), angle: 60.0, flutes, dia, rpm, feed: 800.0, plunge: 250.0, so: 40.0, pd: 1.0, notes: String::new(), tip: 0.0, arc: 0.0, concave: false, flute: 0.0, shank: 0.0, stick: 0.0, color: None, number: None, length_offset: None }
     }
 
     #[test]

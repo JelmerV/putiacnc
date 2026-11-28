@@ -171,7 +171,9 @@ mod matrix {
     /// gui/src/machmgr.rs): the machine decides the dialect, the line numbers and the safe Z.
     fn on_machine(d: &ProjectData, post: &str, units: Units, arcs: bool, o: &Opts) -> ProjectData {
         let mut d = d.clone();
-        let m = machine(post, units, arcs, o);
+        let mut m = machine(post, units, arcs, o);
+        // the project's tool rack stays: it belongs to the machine the project was made on (only the rack cases have one)
+        if let Some(own) = &d.machine { m.tool_table = own.tool_table.clone(); }
         d.job.post = m.post.clone().unwrap_or_default();
         d.job.numbered = m.numbered.unwrap_or(false);
         d.job.safe = m.safe.unwrap_or(5.0);
@@ -237,10 +239,15 @@ mod matrix {
 
     /// The files of one project in every dialect, for the given units and arcs settings, on the machine with options `o`.
     fn files_for(make: &dyn Fn(Units) -> ProjectData, o: &Opts, units: &[Units], arcs: &[bool]) -> Vec<(String, String)> {
+        files_in(make, o, units, arcs, &DIALECTS.map(|d| d.0))
+    }
+
+    /// `files_for` in the given dialects only.
+    fn files_in(make: &dyn Fn(Units) -> ProjectData, o: &Opts, units: &[Units], arcs: &[bool], posts: &[&str]) -> Vec<(String, String)> {
         let mut all = vec![];
         for &units in units {
             let d = make(units);
-            for (post, _) in DIALECTS {
+            for post in posts {
                 for &arcs in arcs { all.extend(case_files(&d, post, units, arcs, o)); }
             }
         }
@@ -383,7 +390,10 @@ mod matrix {
     // dialect; metric only unless the units change text the matrix does not show (see tests/golden/README.md).
 
     /// One option case: a small project, the machine options it runs with, and the units and arcs settings it is written in.
-    struct Case { slug: &'static str, make: fn(Units) -> ProjectData, opts: Opts, units: &'static [Units], arcs: &'static [bool] }
+    struct Case { slug: &'static str, make: fn(Units) -> ProjectData, opts: Opts, units: &'static [Units], arcs: &'static [bool], posts: &'static [&'static str] }
+
+    const ALL: &[&str] = &["", "grblhal", "fluidnc", "mach", "marlin"];
+    const MACH: &[&str] = &["mach"];
 
     const METRIC: &[Units] = &[Units::Metric];
     const NOARCS: &[bool] = &[false];
@@ -392,24 +402,28 @@ mod matrix {
 
     fn cases() -> Vec<Case> {
         vec![
-            Case { slug: "opt-numbered", make: |_| small_job(false), opts: Opts { numbered: true, ..PLAIN }, units: METRIC, arcs: &[false, true] },
-            Case { slug: "opt-start-end-code", make: |_| small_job(false), opts: Opts { start: Some(START), end: Some(END), ..PLAIN }, units: METRIC, arcs: NOARCS },
-            Case { slug: "opt-start-end-code-numbered", make: |_| small_job(false), opts: Opts { numbered: true, start: Some(START), end: Some(END), ..PLAIN }, units: METRIC, arcs: NOARCS },
-            Case { slug: "opt-wcs-g56-spin0", make: |_| small_job(false), opts: Opts { wcs: Some(2), spin_up: 0.0, ..PLAIN }, units: METRIC, arcs: NOARCS },
-            Case { slug: "opt-wcs-g59-1", make: |_| small_job(false), opts: Opts { wcs: Some(6), ..PLAIN }, units: METRIC, arcs: NOARCS },
-            Case { slug: "pause", make: |_| load("hardware_m0_aircut"), opts: PLAIN, units: METRIC, arcs: NOARCS },
-            Case { slug: "pen", make: pen, opts: PLAIN, units: &[Units::Metric, Units::Imperial], arcs: NOARCS },
-            Case { slug: "pen-tool-change", make: |_| small_job(true), opts: PLAIN, units: METRIC, arcs: NOARCS },
-            Case { slug: "rest-pocket", make: rest_pocket, opts: PLAIN, units: METRIC, arcs: NOARCS },
-            Case { slug: "trochoidal", make: trochoidal, opts: PLAIN, units: METRIC, arcs: NOARCS },
-            Case { slug: "photo-vcarve", make: photo, opts: PLAIN, units: METRIC, arcs: NOARCS },
-            Case { slug: "plug-piece", make: plug_piece, opts: PLAIN, units: METRIC, arcs: NOARCS },
+            Case { slug: "opt-numbered", make: |_| small_job(false), opts: Opts { numbered: true, ..PLAIN }, units: METRIC, arcs: &[false, true], posts: ALL },
+            Case { slug: "opt-start-end-code", make: |_| small_job(false), opts: Opts { start: Some(START), end: Some(END), ..PLAIN }, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "opt-start-end-code-numbered", make: |_| small_job(false), opts: Opts { numbered: true, start: Some(START), end: Some(END), ..PLAIN }, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "opt-wcs-g56-spin0", make: |_| small_job(false), opts: Opts { wcs: Some(2), spin_up: 0.0, ..PLAIN }, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "opt-wcs-g59-1", make: |_| small_job(false), opts: Opts { wcs: Some(6), ..PLAIN }, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "pause", make: |_| load("hardware_m0_aircut"), opts: PLAIN, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "pen", make: pen, opts: PLAIN, units: &[Units::Metric, Units::Imperial], arcs: NOARCS, posts: ALL },
+            Case { slug: "pen-tool-change", make: |_| small_job(true), opts: PLAIN, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "rest-pocket", make: rest_pocket, opts: PLAIN, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "trochoidal", make: trochoidal, opts: PLAIN, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "photo-vcarve", make: photo, opts: PLAIN, units: METRIC, arcs: NOARCS, posts: ALL },
+            Case { slug: "plug-piece", make: plug_piece, opts: PLAIN, units: METRIC, arcs: NOARCS, posts: ALL },
+            // phase 3: tool numbers from the machine's tool rack (T5, T7) on the built-in Mach3 / LinuxCNC, the only built-in that writes them
+            Case { slug: "rack", make: |_| load("rack_two_tools"), opts: PLAIN, units: METRIC, arcs: NOARCS, posts: MACH },
+            // one tool numbered on the tool (the second one used, T1), the other by first use: it skips 1 and is T2
+            Case { slug: "rack-first-use", make: rack_first_use, opts: PLAIN, units: METRIC, arcs: NOARCS, posts: MACH },
         ]
     }
 
     fn check_case(slug: &str) {
         let c = cases().into_iter().find(|c| c.slug == slug).unwrap_or_else(|| panic!("no case {slug}"));
-        check_project(c.slug, files_for(&c.make, &c.opts, c.units, c.arcs));
+        check_project(c.slug, files_in(&c.make, &c.opts, c.units, c.arcs, c.posts));
     }
 
     #[test] fn golden_opt_numbered() { check_case("opt-numbered"); }
@@ -424,6 +438,11 @@ mod matrix {
     #[test] fn golden_trochoidal() { check_case("trochoidal"); }
     #[test] fn golden_photo_vcarve() { check_case("photo-vcarve"); }
     #[test] fn golden_plug_piece() { check_case("plug-piece"); }
+    #[test] fn golden_rack() { check_case("rack"); }
+    #[test] fn golden_rack_first_use() { check_case("rack-first-use"); }
+
+    /// The dialect list of the option cases is the matrix's.
+    #[test] fn all_is_every_dialect() { assert_eq!(ALL, DIALECTS.map(|d| d.0)); }
 
     /// Every case has its test above (a case without one would never be compared).
     #[test] fn every_case_has_a_test() {
@@ -524,6 +543,16 @@ mod matrix {
             o.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
         }
         o
+    }
+
+    /// The rack project without its rack: the 6 mm end mill (used second) has its own number 1, so the 1/8" end mill (used first) is
+    /// numbered by first use and skips 1: T2.
+    fn rack_first_use(_: Units) -> ProjectData {
+        let mut d = load("rack_two_tools");
+        if let Some(m) = d.machine.as_mut() { m.tool_table.clear(); }
+        let t = d.tools.iter_mut().find(|t| t.name == "6 mm flat end mill").expect("the 6 mm end mill");
+        t.number = Some(1);
+        d
     }
 
     /// An inlay whose plug is cut from a separate 8 mm piece, as the tests in src/pieces.rs make it: a `-plug` file.
