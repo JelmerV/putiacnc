@@ -153,7 +153,7 @@ G1 X12.7 Y0
 G0 Z5
 M0 Change tool to 6 mm, then touch off Z 0 and resume
 ; Tool: 6 mm
-G4 P0.13
+G4 P130
 G0 X0 Y0
 ; End of program";
     assert_eq!(text(Dialect::Marlin, &program(Dialect::Marlin, Units::Metric)), want);
@@ -541,6 +541,22 @@ fn dwell_units() {
     assert_eq!(render_with(&flags, &prog).lines, vec!["G4 P2 (spin up)", "G4 P0.13"]);
 }
 
+/// Marlin's `G4` reads `P` as milliseconds (`S` is seconds): the built-in writes whole milliseconds, also where seconds × 1000 is
+/// not a whole number in floating point (2.01 s is 2009.9999999999998 ms), and in inch output (a time, not a length).
+#[test]
+fn marlin_dwells_in_whole_milliseconds() {
+    let dwells = [0.13, 2.01, 0.125, 30.0];
+    let mut prog = Program { meta: Meta::default(), events: dwells.iter().map(|&seconds| Event::Dwell { seconds, why: DwellWhy::Requested }).collect() };
+    let want = vec!["G4 P130", "G4 P2010", "G4 P125", "G4 P30000"];
+    assert_eq!(render(Dialect::Marlin, &prog).lines, want);
+    prog.meta.units = Units::Imperial;
+    assert_eq!(render(Dialect::Marlin, &prog).lines, want);
+    // the other built-ins keep seconds, which their controllers read
+    for d in [Dialect::Grbl, Dialect::GrblHal, Dialect::FluidNc, Dialect::Mach] {
+        assert_eq!(render(d, &prog).lines, vec!["G4 P0.13", "G4 P2.01", "G4 P0.125", "G4 P30"], "{d:?}");
+    }
+}
+
 #[test]
 fn comment_styles_inline_comments_and_the_machines_code() {
     let src = |style: &str| format!("[caps]\ntool_change = \"atc\"\ncomments = \"{style}\"\n[templates]\non_section_tool = \"T{{tool.number}} M6 (Tool {{tool.number}}: {{tool.name|comment}})\"\n");
@@ -713,7 +729,7 @@ fn the_builtins_capabilities() {
     let caps = |d| builtin(d).caps().clone();
     for d in [Dialect::Grbl, Dialect::GrblHal, Dialect::FluidNc] { assert_eq!(caps(d), Caps::default(), "{d:?}"); }
     assert_eq!(caps(Dialect::Mach), Caps { tool_change: ToolChangeMode::Atc, wcs_count: 9, ..Caps::default() });
-    assert_eq!(caps(Dialect::Marlin), Caps { spindle: SpindleCtl::Manual, comments: CommentStyle::Semicolon, wcs_count: 1, ..Caps::default() });
+    assert_eq!(caps(Dialect::Marlin), Caps { spindle: SpindleCtl::Manual, dwell: DwellUnit::Milliseconds, comments: CommentStyle::Semicolon, wcs_count: 1, ..Caps::default() });
     // the work offset as Job::wcs_name gave it for each dialect
     for (post, _) in crate::model::DIALECTS {
         for wcs in 0..10u8 {
