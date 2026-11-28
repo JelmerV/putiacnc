@@ -28,11 +28,12 @@ changes the project inside a drawing function, it probably belongs in core.
 | `model` | The data structures above, with serde defaults for old files. |
 | `shapes` | Making and changing shapes, per-operation defaults, `add_operation` / `add_inlay`, `GroupCopies` (fresh group ids when copying), tabs bookkeeping. |
 | `clip` | A thin safe wrapper over Clipper 6.4 for offsets and boolean operations. |
-| `arcs` | Rewrites runs of short straight moves that lie on a circle as G2/G3 lines. |
+| `arcs` | Fits runs of short straight cuts that lie on a circle as arcs (`fit_items`, on the numbers as written; `fit_arcs` reads text into the same items). The post engine uses it. |
 | `trim`, `cleanup` | The Trim and Extend tool; the Clean up command for imported drawings (joins paths, drops duplicates, finds open contours). |
 | `svg`, `dxf`, `bitmap`, `text` | Importers and the font-to-outline code. |
-| `toolpath` | `generate(&ProjectData, Units) -> Output`: profile, pocket, V-carve, drill, inlay, tabs, lead-in; the emitter pushes the program as events, with the move list and a time estimate. |
-| `program` | The intermediate representation between the generator and the text (`Program`, `Event`, phase 1 of `docs/post-processor-spec.md`), and `render_canonical`: the events written as the built-in dialects' text (moves, setup, tool change, spindle, dwell, stops, end, arc fitting, start/end code, Marlin comments, line numbers), with a source map from each line to its event. |
+| `toolpath` | `generate(&ProjectData, Units) -> Output`: profile, pocket, V-carve, drill, inlay, tabs, lead-in; the emitter pushes the program as events, with the move list and a time estimate. It reads the job's post's capabilities (manual or automatic tool change, who runs the spindle, work offsets) and holds no dialect branches. |
+| `program` | The intermediate representation between the generator and the text (`Program`, `Event`, `docs/post-processor-spec.md`). |
+| `post` | Post-processors (phase 2 of the spec): the `Post` trait and `Caps`, the engine that loads a post package (TOML manifest, `manifest.rs`; templates checked at load, `template.rs`) and renders a program with it (`engine.rs`: arc fitting, handlers, word modes, start/end code, line numbers, a source map), number formats and text filters (`text.rs`), and the five built-in dialects as embedded packages (`builtin/<name>/post.toml`). How to write one: `docs/posts/authoring.md`. |
 | `relief` | The 3D model roughing, finishing and detail (rest machining) passes. |
 | `rest` | Rest machining of pockets: what the main cutter leaves (the pocket minus the pocket "opened" by the cutter) and the area a smaller cutter must visit. |
 | `joints` | Dogbone corner reliefs and finger joints, and the box plates. |

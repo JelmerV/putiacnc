@@ -79,6 +79,7 @@
   "Not a valid machine list: {e}": "",
   "Keep at least one machine.": "",
   "This is not a PutiaCNC machine file.": "",
+  "This post writes no arcs (G2/G3): circles and trochoidal loops stay as short straight moves.": "",
   "Not an STL file.": "",
   "The STL file has no triangles.": "",
   "The OBJ file has a vertex with missing coordinates.": "",

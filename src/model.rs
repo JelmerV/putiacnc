@@ -217,8 +217,8 @@ fn is_zero_u8(v: &u8) -> bool { *v == 0 }
 pub const WCS: [&str; 9] = ["G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3"];
 
 impl Job {
-    /// How many systems this controller has: GRBL knows G54 to G59, Mach3 / LinuxCNC three more.
-    pub fn wcs_count(&self) -> usize { if self.mach() { 9 } else if self.marlin() { 1 } else { 6 } }
+    /// How many systems this controller has (its post's `caps.wcs_count`): GRBL knows G54 to G59, Mach3 / LinuxCNC three more.
+    pub fn wcs_count(&self) -> usize { use crate::post::Post; crate::post::for_job(self).caps().wcs_count as usize }
     /// The G-code word of the chosen system (G54 when the choice is not one this controller has).
     pub fn wcs_name(&self) -> &'static str { let i = self.wcs as usize; if i < self.wcs_count() { WCS[i] } else { WCS[0] } }
 
@@ -233,6 +233,7 @@ impl Job {
 /// The controllers a machine can be set to: "" = GRBL, "grblhal", "fluidnc" (both write what GRBL gets today), "mach", "marlin" (motion only: the operator runs the spindle by hand).
 pub const DIALECTS: [(&str, &str); 5] = [("", "GRBL"), ("grblhal", "grblHAL"), ("fluidnc", "FluidNC"), ("mach", "Mach3 / LinuxCNC"), ("marlin", "Marlin (no spindle control)")];
 
+/// The dialect's name (the GUI lists these; each is its built-in post's name, which the G-code's first comment writes).
 pub fn dialect_name(post: &str) -> &'static str { DIALECTS.iter().find(|d| d.0 == post).map_or("GRBL", |d| d.1) }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

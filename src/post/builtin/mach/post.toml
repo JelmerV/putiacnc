@@ -1,0 +1,64 @@
+# Mach3 / LinuxCNC: the controller changes the tool itself (T# M6), nine work coordinate systems, M30 at the end.
+# Byte for byte what PutiaCNC wrote before posts were packages (tests/golden).
+
+[post]
+format_version = 1
+name = "Mach3 / LinuxCNC"
+extension = "nc"
+line_ending = "lf"
+
+[caps]
+arcs = "xy"
+max_arc_sweep = 180
+tool_change = "atc"       # T# M6, no stop for the operator; the machine stands still at the change
+length_offset = false     # no G43 H#: the controller's own tool-change macro handles the length
+spindle = "controlled"
+dwell = "seconds"
+comments = "paren"        # Mach3 has no ; comments
+wcs_count = 9             # G54 to G59, G59.1 to G59.3
+
+[format]
+xyz = { decimals = 3, inch_decimals = 4, length = true }
+feed = { decimals = 1, inch_decimals = 2, length = true }
+rpm = {}
+seconds = {}
+
+[words]
+X = { format = "xyz", mode = "as_given" }
+Y = { format = "xyz", mode = "as_given" }
+Z = { format = "xyz", mode = "as_given" }
+I = { format = "xyz", incremental = true }
+J = { format = "xyz", incremental = true }
+F = { format = "feed", mode = "as_given" }
+S = { format = "rpm" }
+P = { format = "seconds" }
+
+[modal]
+motion = { codes = ["G0", "G1", "G2", "G3"], always = ["G0", "G1", "G2", "G3"] }
+
+[templates]
+# metric or imperial, absolute, XY plane, feed per minute; cancel cutter compensation, tool length and canned cycles; the work offset
+on_open = """
+{units} G90 G17 G94
+G40 G49 G80
+{wcs}
+"""
+on_section = ""
+on_section_end = ""
+# Mach3 and some LinuxCNC setups choke on anything but plain ASCII inside a comment
+on_section_tool = "T{tool.number} M6 (Tool {tool.number}: {tool.name|comment})"
+on_rapid = "{G} {X} {Y} {Z}"
+on_linear = "{G} {X} {Y} {Z} {F}"
+on_circular = "{G} {X} {Y} {I} {J} {F}"
+on_dwell = "G4 {P}"
+on_command = """
+?spindle_on: M3 {S}
+?spindle_off: M5
+?stop: M0 ({message})
+?optional_stop: M1 ({message})
+"""
+on_comment = "({text})"
+on_close = """
+G0 {X:park} {Y:park}
+M30
+"""

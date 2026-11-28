@@ -96,8 +96,10 @@ Design rules:
 
 - **Intent, not syntax.** The generator says `ToolChange` and `SpindleOn`; whether that becomes `T5 M6` (tool change), `M0 (Change tool…)` (program pause) or an operator prompt on Marlin is the post's choice. Today's `select_tool()` logic for each dialect moves into the posts.
 - **Every event keeps its index.** Posts return which event each output line came from (a source map). The 3D preview, the G-code panel and the time breakdown use that map instead of parsing the user's dialect.
-- **Arcs are fitted on the IR**, not on text. `arcs::fit_arcs` is ported to work on `Feed` runs and runs only when the post says it supports arcs. Until the port matches today's output exactly, the canonical post keeps the text-based fitter (phase 2).
+- **Arcs are fitted on the IR**, not on text. The post engine fits runs of `Feed` events (`arcs::fit_items`) on the numbers the post writes (output units, rounded by its X/Y format), before it renders, and writes each arc through `on_circular`; `caps.arcs = none` fits nothing. Since phase 2 this is the only fitter in use; `arcs::fit_arcs` is a thin wrapper that reads text into the same items, and a test compares the two on every golden program.
 - **Times stay with the generator.** The `Move` list and time estimate are built from the IR, so they do not depend on the post.
+
+**As built (phases 1 and 2).** `src/program.rs` differs from the sketch above where today's output needed it (details in `docs/implementation-log.md`): an `Event::Setup` for the setup block (`on_open`); `OperationStart { index, name }` (name = the operation's kind) and `OperationEnd { index }`, while the operation's description stays `Comment` events; `ToolChange { tool }` without `next` (the engine finds the next tool); `SpindleOn { rpm }` without a direction; `Feed { to, feed, write_feed }` without `kind`, where `write_feed` gives the feed the way `to` gives axes (the generator's modal rule); `Arc(Box<ArcTo>)` (boxed, so an event stays 48 bytes; the generator writes none yet); `ToolRef.number` is a `u32`, the order of first use until phase 3; `Xyz` is three numbers and a mask. `Meta` holds the units, the resolved work offset, and, until phase 4a makes them properties, `numbered`, `arcs`, `start_code`, `end_code`, `start_at` and the trochoidal ranges. A requested dwell is rounded to 0.01 s by the generator (a value, not a format).
 
 ## Post-processor interface
 
@@ -136,23 +138,27 @@ pub struct Rendered {
     pub lines: Vec<String>,
     pub source: Vec<Option<usize>>,   // event index per line
     pub extension: String,            // "nc", "gcode", "tap"
-    pub line_ending: LineEnding,      // Lf | CrLf
+    pub line_ending: LineEnding,      // Lf | Crlf
     pub notes: Vec<String>,           // warnings raised by the post
+    pub troch_arcs: usize,            // arcs fitted (for the generator's notes)
+    pub arcs: usize,
 }
 ```
 
-One engine implements the trait: it loads a post package (manifest, templates, optional Rhai script), described in the next section. Units are always mm in user posts.
+One engine implements the trait: it loads a post package (manifest, templates, optional Rhai script), described in the next section. Units are always mm in user posts. (Phase 2: `ToolChange` here is the enum `ToolChangeMode` in the code, so that it does not clash with the event; `Package` is the engine's type; `post::test_program(&caps)` is the fixed test program.)
 
 **How the generator uses capabilities**
 
 | Capability | Generator behaviour |
 | --- | --- |
-| `arcs = None` | No arc fitting; trochoidal loops stay as short lines with a warning |
+| `arcs = None` | No arc fitting; trochoidal loops stay as short lines with a warning (the post engine fits, so the post writes the note) |
 | `tool_change = Manual` | Emits a `Stop` with the "change tool, touch off Z0" message before `ToolChange` (today's GRBL behaviour) |
-| `tool_change = Atc` | No stop; requires every used tool to have a number, else an export error |
-| `length_offset = false` with `Atc` | Warning: "every tool after the first relies on the controller's own length handling" |
-| `spindle = Manual` | `SpindleOn` becomes a `Stop` asking the operator (today's Marlin behaviour) |
+| `tool_change = Atc` | No stop, and the machine stands still at the `ToolChange` (`Move.stop`; Mach3 / LinuxCNC today). Phase 3: requires every used tool to have a number, else an export error |
+| `length_offset = false` with `Atc` | Phase 3: warning "every tool after the first relies on the controller's own length handling" (not for the built-in Mach3 / LinuxCNC, whose notes must not change) |
+| `spindle = Manual` | `SpindleOn` becomes a `Stop` asking the operator, no `SpindleOff` and no spin-up `Dwell`; the tool-change and pause messages start "Stop the spindle", the end is a stop "Stop the spindle, then resume" (today's Marlin behaviour). A requested `Dwell` (a pen's) stays |
 | `dwell = None` | No spin-up `Dwell` events |
+| `wcs_count` | The work offset: the job's choice when the controller has it, else G54 |
+| the post's name | The first comment: `(PutiaCNC - <name>)` |
 
 **Built-in posts are post packages too.** GRBL, grblHAL, FluidNC, Mach3/LinuxCNC and Marlin ship as packages embedded in the binary (`include_str!`), run by the same engine as user posts. That dogfoods the format, removes the Rust dialect code, and lets any built-in be copied and customised.
 
@@ -204,9 +210,9 @@ comments = "none"
 stop_spindle_before_tool_change = { type = "bool", default = true, title = "Stop spindle (M5) before M06" }
 preselect_next_tool = { type = "bool", default = false, title = "Pre-select next tool after M06" }
 
-[format]
-xyz  = { decimals = 3 }
-feed = { decimals = 1 }
+[format]                  # trim = false keeps the zeros VCarve writes: X74.232, Z14.280, F2500.0
+xyz  = { decimals = 3, trim = false }
+feed = { decimals = 1, trim = false }
 rpm  = { decimals = 0 }
 
 [words]                   # modal = written only when the value changes
@@ -248,21 +254,30 @@ M30
 
 One ordering difference from VCarve: the first tool is loaded by `on_section_tool`, so the `G54 X0 Y0` (move to job zero) comes after `M06` (tool change), `G43` (length offset) and `M03` (spindle on), instead of between them. Both are safe; Z stays fully up throughout.
 
-**Template rules.** `{X}`-style words come from `[words]` and are empty when modal and unchanged. `{G}` comes from the modal group. A line starting `?name:` is written only when that property or flag is true. Nothing else: no loops, no expressions. Unknown words, properties or handlers are load errors.
+**Template rules.** (Reference with examples: `docs/posts/authoring.md`.)
+
+- `{X}`-style words come from `[words]`: X Y Z (target; `{X:park}` the park position), I J (arc centre from its start), F, S, P (dwell in the `caps.dwell` unit). Each has a format from `[format]` (`decimals`, `inch_decimals`, `trim`, `length`; rounding as `toolpath::to_fixed`, never `-0`) and a mode: `as_given` (written when the event gives it: the axes the move changes, the feed when `Feed.write_feed`; the built-ins' rule), `modal` (`modal = true`: written when its text changes, again after a section start, a tool change and a stop) or `always` (the default). `S{S}` is an error: the word writes its letter.
+- `{G}` comes from the modal group `motion` (G0 G1 G2 G3; codes in `always` are written on every move).
+- `{name}` is a variable (`units`, `wcs`, `text`, `message`, `section.number`, `section.name`, `tool.number`, `tool.offset`, `tool.name`, `next_tool.*`, `prop.<key>`); `{name|comment}` and `{name|plain}` filter it (safe in a comment; a plain message for controllers that show everything after `M0`).
+- A placeholder with no value takes the whitespace before it; a line whose placeholders all have no value is left out.
+- A line starting `?name:` is written only when that property or flag is true, `?!name:` only when it is false.
+- A whole-line `( … )` is a comment and an ending `( … )` an inline comment, both written in `caps.comments` style (`(…)`, `; …`, nothing), also for whole-line comments in the machine's start and end code. `;` is plain text in a template (GRBL's `M0 ; message`).
+- Nothing else: no loops, no expressions. Unknown keys, words, formats, properties, variables, filters, flags or handlers, and a word or variable used where it has no value, are load errors with the file, the line and the fix. A spindle start or stop, an operator stop, or (with `atc`) a tool change that a template renders as nothing is a render error.
+- Line numbers (`N10`, step 10) and the machine's start code (before the first lift) and end code (before the last line) are added by the engine after everything else, for every package.
 
 **Handlers**
 
 | Handler | Called | Default when not defined |
 | --- | --- | --- |
-| `on_open` | Once, before anything | Units, `G90` (absolute coordinates), `G17` (XY plane), the work offset |
-| `on_section(s)` | Each operation start | A comment with the operation name |
-| `on_section_tool(s)` | First section, and when the tool changes | Per `caps`: `M5` (spindle stop), `T# M6` (tool change), `G43 H#` (length offset), `M3 S` (spindle on), or a stop with a message for manual change |
-| `on_section_end(s)` | Each operation end | Nothing |
-| `on_rapid` / `on_linear` / `on_circular` | Each move | `G0` (rapid move) / `G1` (cutting move) / `G2`-`G3` (arc moves) with words |
-| `on_dwell(d)` | Spin-up or requested pause | `G4 P` (dwell pause) in the `caps.dwell` unit |
-| `on_command(c)` | `spindle_on`, `spindle_off`, `stop`, `optional_stop`, `coolant_on`, `coolant_off` | `M3` (spindle on), `M5` (spindle stop), `M0` (program pause), `M1` (optional pause), `M8` (coolant on), `M9` (coolant off) |
-| `on_comment(t)` | Comments | Per `caps.comments` |
-| `on_close` | After the last event | `M5` (spindle stop), park, `M30` (program end) |
+| `on_open` | Once, at the setup (after the two header comments) | `{units} G90 G17 {wcs}`: units, `G90` (absolute coordinates), `G17` (XY plane), the work offset |
+| `on_section(s)` | Each operation start | Nothing (the generator writes the operation's description as `Comment` events) |
+| `on_section_tool(s)` | Each `ToolChange`: the first tool, and when the tool changes (flags `first`, `has_next`) | Per `caps`: manual `(Tool: name)` (the `Stop` before it asked the operator); atc `T# M6 (Tool #: name)`, plus `G43 H#` (length offset) with `length_offset`. `M5` and `M3 S` are the separate `SpindleOff` / `SpindleOn` events around it |
+| `on_section_end(s)` | Each operation end, after its pause | Nothing |
+| `on_rapid` / `on_linear` / `on_circular` | Each move (a fitted arc through `on_circular`) | `{G} {X} {Y} {Z}`, `{G} {X} {Y} {Z} {F}`, `{G} {X} {Y} {Z} {I} {J} {F}` |
+| `on_dwell(d)` | Spin-up or requested pause (flags `spin_up`, `requested`) | `G4 {P}` (dwell pause) in the `caps.dwell` unit |
+| `on_command(c)` | `spindle_on`, `spindle_off`, `stop`, `optional_stop`, `coolant_on`, `coolant_off`, as `?flag:` lines of one template | `M3 {S}` (spindle on), `M5` (spindle stop), `M0 ({message})` (program pause), `M1` (optional pause), `M8` (coolant on), `M9` (coolant off) |
+| `on_comment(t)` | Comments (flags `info`, `operation`, `pass`, `warning`) | `({text})`, written per `caps.comments` |
+| `on_close` | The `ProgramEnd` | `G0 {X:park} {Y:park}`, `M30` (program end); `M5` is the `SpindleOff` before it |
 
 **Rhai handlers** override any template. [Rhai](https://rhai.rs) fits the Rust codebase: pure Rust, sandboxed by default, with operation and memory limits. `block()` works like Fusion's `writeBlock`: it joins words, drops empty modal words and adds the line number.
 

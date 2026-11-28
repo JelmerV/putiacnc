@@ -79,6 +79,7 @@
   "Not a valid machine list: {e}": "Elenco macchine non valido: {e}",
   "Keep at least one machine.": "Tieni almeno una macchina.",
   "This is not a PutiaCNC machine file.": "Questo non è un file macchina di PutiaCNC.",
+  "This post writes no arcs (G2/G3): circles and trochoidal loops stay as short straight moves.": "Questo post-processore non scrive archi (G2/G3): cerchi e anelli trocoidali restano brevi movimenti rettilinei.",
   "Not an STL file.": "Non è un file STL.",
   "The STL file has no triangles.": "Il file STL non ha triangoli.",
   "The OBJ file has a vertex with missing coordinates.": "Il file OBJ ha un vertice con coordinate mancanti.",
