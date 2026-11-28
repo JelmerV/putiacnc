@@ -395,4 +395,107 @@ non-move lines, as the text fitter did.
 
 ### Equivalence beyond the goldens
 
-(Gate results, timing and the random-project comparison: added when the gate has run.)
+Besides the goldens and `tests/arc_fitter.rs`, a temporary test (not committed) wrote `generate()`'s output for the 300 random
+projects of `tests/random_projects.rs` (seeds 0 to 299) in all 5 dialects, mm and inch, arcs off and on, with the G-code, the
+notes, the times, the move count and every `Move.stop` flag, once on `main` and once on this branch: 6,000 files each,
+byte-identical (`diff -r` empty). To reach the corners the goldens do not, a third of the projects got a tool named
+"X5 Y-3 cutter", a quarter a pause message "move X10 Y2 away (clamp)" on every operation (X/Y words in Mach3's tool lines and in
+GRBL stop messages, which the fitter reads), and a seventh start and end code. The files hold 1,345,140 arc lines and 11,572
+stops; 100 of them are the same refusal message on both sides.
+
+### Gate: what was run
+
+- `cargo test --workspace`: 47 test binaries, 743 passed, 0 failed, 11 ignored (phase 1: 46 binaries, 717). `git diff --stat main
+  -- tests/golden tests/data` is empty: no golden file and no snapshot changed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `grep -nE 'mach|marlin|dialect' src/toolpath.rs`: only lines with `machine` and seven with "rest machining"; with
+  `| grep -v machine`, only the seven "machining" lines. No dialect branch.
+- CLI: `putia-gcode examples/projects/oval-sign.project.json -o …` and with `--imperial`: exit 0, "14813 lines, cutting 11465.8 mm,
+  estimated 38.0 min", no `note:` lines (the golden notes files are empty), the same bytes as
+  `tests/golden/oval-sign/grbl-metric-noarcs.nc` and `grbl-imperial-noarcs.nc`.
+- UI: `cargo build -p putiacnc-gui`, `scripts/shot.sh -e PUTIACNC_TAB_GCODE=1 tests/data/two_ops_toolchange.project.json`: the
+  G-code tab shows "G-code (482 lines)" with the summary header, `(PutiaCNC - GRBL)`, `G21 G90 G17 G94 G54`, `G0 Z5`,
+  `(Tool: 1/8in flat end mill)`; "What this will do" reads one pause for the tool change and 5594 mm of cutting; the status bar
+  482 lines and 5594.2 mm, as the CLI writes for that project.
+- `cargo run --example check_post -- builtin:grbl` writes exactly the test program shown in `docs/posts/authoring.md`; the spec's
+  TX-35 manifest renders in VCarve's form; a package with `P{P}` is refused with its file, line and fix (exit 1).
+
+### Timing
+
+Release build (LTO), this 4-core container, `cargo run --release --example gen_time`, `main` (756f6c4) and this branch built
+side by side and run alternately on the idle machine, two rounds; median of 9 runs (5 for the big ones), minimum in brackets.
+
+| Program | main | branch | branch / main |
+|---|---|---|---|
+| sample-shaped-relief (GRBL, mm, arcs off): 7,541 lines, 7,225 moves | 0.164 / 0.161 s (0.154) | 0.154 / 0.161 s (0.146) | 0.94 / 1.00 |
+| `BUSY=60`: 1,051,919 lines, 1,049,748 moves, arcs off | 1.547 / 1.605 s (1.471) | 1.627 / 1.534 s (1.521) | 1.05 / 0.96 |
+| the same with arcs on (196,343 lines) | 1.836 / 1.850 s (1.742) | 1.665 / 1.771 s (1.576) | 0.91 / 0.96 |
+
+Interpreting the templates per event costs nothing measurable against the toolpath geometry: within the run-to-run noise
+(5 %) with arcs off, and arcs on is a little faster because the fitter takes numbers from the events instead of parsing every
+line. Nothing is near the 1.3× that would need a closer look. An event is still 48 bytes (`Arc` is boxed), so `Output.clone()`
+is unchanged. The built-in packages are parsed once, at first use.
+
+### Open problems
+
+- **Marlin's dwell unit.** Marlin reads `G4 P` as milliseconds; the built-in writes the pen's dwell in seconds (`G4 P0.13`), as
+  PutiaCNC always did and the goldens freeze, so on Marlin the pen waits 0.13 ms. The fix (`dwell = "milliseconds"` in the Marlin
+  package, or `G4 S`) is a reviewed golden change for after phase 2.
+- **The fitter reads X/Y words in text.** To stay identical, the engine reads non-move lines with `arcs::xy`, as the text fitter
+  did: a GRBL stop "M0 ; move X10 away" or a Mach3 line "T1 M6 (Tool 1: X5 bit)" sets the fitter's idea of X, and a run of cuts
+  that follows before a move gives X again is fitted from that wrong start (its arc carries the fitter's end point, not the
+  tool's). No golden and no random program showed a difference, but it is wrong in principle. Phase 4a: take the position from
+  the IR only (a reviewed change; add a golden case that shows it first). The same goes for the fitter not knowing the position
+  at the start of a range until X and Y have both been seen.
+- **`caps.dwell = "none"` drops a requested dwell silently** (`{P}` has no value, so the line is left out). Only a user post can
+  have it; it deserves a note.
+- **User posts in inch.** Only formats with `length = true` are converted; the spec says user posts are mm only, so phase 4a
+  should refuse inch output for a non-built-in package (or require `length` on the X/Y/Z/I/J/F formats).
+- **The TX-35 sketch** shows what phase 4a has to settle: the generator's `SpindleOn` also reaches `on_command` (`M3 S18000` after
+  the template's `S18000M03`), its `SpindleOff` before a change doubles `?stop_spindle_before_tool_change: M5`, `{Z:park}` writes
+  the current height (the IR's park has no Z), and the tool numbers are the order of first use until phase 3.
+- `caps.max_line_len` stops the export (an error), not a note; a long comment would block it. Revisit when a post uses it.
+- Unchanged from phase 1: `summary`, `split` and `pieces` still edit the text after `generate()`, so `Output.lines` and
+  `Output.program` differ for their outputs; the summary reads the text (the `M3` line and the `G4` after it, `M0` messages).
+- `model::DIALECTS` names and the posts' names are two lists (a test pins them equal) until phase 4a moves the choice to the
+  machine; `Job::mach()` and `Job::marlin()` remain for the GUI only.
+
+### Traps for phase 3 (tool numbers)
+
+- **The built-in Mach3 / LinuxCNC is an ATC post** (`tool_change = "atc"`, no `G43`): it writes `T{tool.number}` with today's
+  order-of-first-use numbers. The spec's "ATC: every used tool must have a number, else an export error" and "ATC without length
+  offsets: warning" would break every Mach3 job or add a note to every Mach3 program (a golden `.notes.txt` change). Phase 3
+  needs a way for Mach3 to keep order-of-first-use numbers and no warning (a capability, e.g. `tool_numbers = "first_use"`, or a
+  rule that only applies to user posts).
+- `ToolRef.number` is set in `select_tool` / `select_pen` from `ToolSt.ids` (order of first use, pens included); `length_offset`
+  is always `None`, so `{tool.offset}` is the number. Phase 3 resolves both there; the post only reads them.
+- `on_section_tool` is driven by `ToolChange` events, not by `OperationStart` (an operation can have up to three tools: inlay,
+  relief, rest pass). `next_tool.*` comes from the next `ToolChange` in the program; `{S}` there from the `SpindleOn` after it.
+- With `atc`, a `ToolChange` that a package renders as nothing is an error (`must_write`); with `manual` it may write nothing
+  (the stop before it carries the message).
+- The operation markers are not counted in the trochoidal windows (8 events before the loops, markers skipped) and an empty
+  operation has none (`Em::end_op` takes back an `OperationStart` with nothing after it). Any new event that writes no line for
+  the built-ins must be skipped there too, or the fitter's window shrinks.
+- Modal state is forgotten at `OperationStart`, `ToolChange` and `Stop`; the built-ins do not notice, a user post with modal
+  words does (it writes them again).
+- Template line numbers in errors assume no line-continuation backslashes inside a multi-line TOML string.
+
+### Tests added in phase 2
+
+- `src/post/tests.rs`: the phase 1 renderer's tests with unchanged expectations (the two-tool program in every dialect, mm and
+  inch; start/end code and line numbers with their source entries; every event's lines; a fitted arc's source; trochoidal ranges
+  only, also a range that starts at the loops; stops read back, Marlin's empty message `M0 `); the operation markers write nothing
+  and do not break a run; every handler's default; a TX-35-style package (modal words, padded numbers, modal G1, no comments, no
+  dwell, `{S}M03`, `G43H#`); the three word modes for axes and for F; the motion group with and without `always`; `?` lines with
+  properties, flags, negation and machine values; tool variables and flags; dwell units; the three comment styles with inline
+  comments and the machine's code; an `Arc` event (mm, inch, the default helix template, an unknown start); `{Z:park}` and braces;
+  `arcs = "none"` with its note and a smaller sweep; every load error with its file and line (version, syntax, unknown keys and
+  sections, wrong types, caps ranges, properties, formats, words, the motion group, templates in single and multi-line strings);
+  the render errors (spindle on a manual post, a stop / spindle / ATC change that writes nothing, a line too long); the lint of
+  every built-in (loads twice to the same result, name = `DIALECTS` label, renders the test program in mm and inch with an arc
+  and the right stops); the built-ins' capabilities and work offsets against `Job::wcs_name`; `Dialect::from_post`; the TX-35
+  manifest read from the spec. The whole-program dialect tests of phase 1 (`mod generated`) moved here unchanged.
+- `src/post/template.rs`: parsing (leads, conditions, comment and inline lines, park, properties) and every template error,
+  including `P{P}`. `src/post/text.rs`: number formats (trimmed, padded, inch, raw, ties, `-0`), both filters, comment styles.
+- `src/program.rs`: the new events do not halt; only the markers are markers.
+- `tests/arc_fitter.rs`: the IR fitter against the text fitter on the golden programs (above).
