@@ -37,6 +37,7 @@ line_ending = "lf"
 arcs = "xy"               # G2/G3 in the XY plane
 max_arc_sweep = 180
 tool_change = "manual"    # the program stops and asks the operator to change the tool
+tool_numbers = "first_use" # tools without a rack slot or a number of their own: 1, 2, 3... by first use
 length_offset = false
 spindle = "controlled"    # M3 / M5
 dwell = "seconds"         # G4 P<seconds>
@@ -51,7 +52,8 @@ The generator reads the capabilities **before** it generates, so they decide whi
 | `arcs` | `xy`, `helical`, `none` | `none`: no arc fitting at all, and a note ("This post writes no arcs …"). `helical` fits what `xy` fits (XY arcs) for now. |
 | `max_arc_sweep` | `180` | Degrees of the longest fitted arc, more than 0 and at most 180. |
 | `tool_change` | `manual`, `atc` | `manual`: a stop with "Change tool to …, then touch off Z0 and resume" before each change. `atc`: no stop; the machine stands still at the change (the next move starts from rest in the time estimate). |
-| `length_offset` | `false`, `true` | With `atc`, the default `on_section_tool` adds `G43 H{tool.offset}`. |
+| `tool_numbers` | `required` with `atc`, `first_use` with `manual` | How a tool gets the number `{tool.number}` writes when neither the machine's tool rack nor the tool itself gives one (see "Tool numbers" below). `required`: such a tool stops the export, naming it. `first_use`: 1, 2, 3… in order of first use, skipping the numbers numbered tools of the program have. The built-in Mach3 / LinuxCNC is an `atc` post with `first_use`. |
+| `length_offset` | `false`, `true` | With `atc`, the default `on_section_tool` adds `G43 H{tool.offset}`, and the export checks that every `M6` is followed by a `G43` with that tool's `H` before the first Z move. With `atc`, `required` and `false`, the export notes that every tool after the first relies on the controller's own length handling. |
 | `spindle` | `controlled`, `manual` | `manual`: no spindle commands and no spin-up wait; the program stops and asks the operator to start the spindle (and to stop it before a pause, a tool change and at the end). |
 | `dwell` | `seconds`, `milliseconds`, `none` | The unit of `{P}`. `milliseconds`: seconds × 1000, for controllers whose `G4` reads `P` as milliseconds (Marlin); give `P` a format with `decimals` (the Marlin built-in has `decimals = 0`), as seconds × 1000 is not always a whole number in floating point. `none`: no spin-up wait, and `{P}` has no value. |
 | `comments` | `paren`, `semicolon`, `none` | How comment lines are written (see Templates). |
@@ -165,7 +167,8 @@ G0 X0 Y0
 M2
 ```
 
-grblHAL and FluidNC are this file with another `name`. Mach3 / LinuxCNC changes `tool_change` to `atc`, `wcs_count` to 9,
+grblHAL and FluidNC are this file with another `name`. Mach3 / LinuxCNC changes `tool_change` to `atc` (with
+`tool_numbers = "first_use"`, so a tool without a rack slot keeps its order-of-first-use number), `wcs_count` to 9,
 writes `G40 G49 G80` in `on_open`, `T{tool.number} M6 (Tool {tool.number}: {tool.name|comment})` and `M0 ({message})`.
 Marlin sets `spindle = "manual"` and `comments = "semicolon"` and writes its stops `M0 {message|plain}`.
 
@@ -188,7 +191,23 @@ Each event goes through one handler. A handler left out of `[templates]` gets th
 | `on_close` | the end of the program | | `{X:park} {Y:park} {Z:park}` | `G0 {X:park} {Y:park}`, `M30` |
 
 In every handler: `units` (`G21` or `G20`), `wcs` (the work offset), `prop.<name>` (a property's value), and any true/false
-property as a flag. `tool.offset` is the tool's length offset register, the tool number when it has none.
+property as a flag. `tool.number` is the tool's resolved number and `tool.offset` its length offset register (see "Tool
+numbers").
+
+## Tool numbers
+
+The rack slot belongs to the machine, not the tool. At export, each tool the program uses gets its number, first match wins:
+
+1. the machine's tool rack: an entry `{ "tool_id": "…", "number": 5, "length_offset": 15 }` in the machine's `toolTable`;
+2. the tool's own `number` (set in the tool manager);
+3. the order of first use (1, 2, 3…), only when `caps.tool_numbers = "first_use"`; these numbers skip every number that
+   steps 1 and 2 gave to a tool of the same program, so a numbered tool used later never shares its number.
+
+With `tool_numbers = "required"` a tool that reaches step 3 stops the export with its name. Two different tools of one
+program on the same number stop the export with every post. `{tool.offset}` is the rack entry's `length_offset` (when the
+number came from the rack), else the tool's own `length_offset`, else the number: `T5` gets `H5`. A program split into one
+file per tool numbers each file on its own, so with `first_use` a tool can have another number in its own file than in the
+whole program; give the tools rack slots when that matters.
 
 The spindle start, the spindle stop and the stop for the operator must write a line (with `atc`, the tool change too): a
 template that writes nothing for one of them stops the export, so a stop can never vanish from a program.
@@ -231,6 +250,30 @@ Types: `bool`, `int`, `number`, `text`, `enum` (with `options = ["a", "b"]`). A 
 any property is written with `{prop.name}`. Phase 4a shows them in the machine manager and saves the values with the
 machine; until then the defaults apply.
 
+One property name is **well known**: `stop_spindle_before_tool_change`. When it is on (the machine's value, else the
+package's default) and the post is an `atc` post, the export reads the finished text and refuses it if any `M6` comes while
+the spindle runs (an `M3` with no `M5` since). The check reads the text, not the template, so a package can write the `M5`
+any way it likes; it only has to be there.
+
+## What the export checks in your text
+
+Every program a post writes is read back by `verify`, which parses the final text itself and shares no code with the engine.
+What it knows of your package is a small description built from the manifest: the comment style, that `I`/`J` are from the
+arc's start, whether every motion code is written on every move (`[modal] motion always`), the dwell unit and the decimals
+of `X`/`Y`/`Z`/`I`/`J`. It reads text without spaces (`G1X74.934Y70.699Z8.200`, `M06T11`, `G43H11`), lines that continue the
+last motion (`X76.242Y69.401`), padded numbers and line numbers. Two checks stop the export:
+
+- **The moves are the program's moves.** Each move line must go where the program's next move goes, in order, within half a
+  unit of your last decimal (0.0005 mm with 3 decimals) plus 1e-9. A fitted arc must end where the cuts it replaces end, with
+  every one of them on the arc within the fitter's tolerance (0.005 mm) plus the rounding of the numbers, going round its way.
+  A move the program has that goes nowhere at your resolution (a feed-only `G1 F800`, a modal word that does not change) may be
+  missing; a template line that goes nowhere (`G0{Z:park}`) may be extra. The machine's own start and end code is not checked
+  (the export notes it when it has moves). The error names the line, its text and where the program goes instead.
+- **With `tool_change = "atc"`, tool changes are safe:** the `T` loaded at each `M6` is the tool the program changes to (and
+  every `T` word is one of its tools); with `length_offset = true`, a `G43` with that tool's `H` follows every `M6` before the
+  first Z move; the spindle runs for every cutting move (a pen draws with it off: after `(Pen: …)`, or after an `M6` with a
+  pen's tool number when the post writes no comments); with `stop_spindle_before_tool_change` on, no `M6` while it runs.
+
 ## Sketch: the TX-35 manifest of the spec
 
 The TX-35 package itself comes in phase 4a. Its manifest as the spec shows it (section "Post packages") loads and renders
@@ -261,5 +304,6 @@ M30
 That is the VCarve output's form: no spaces, padded decimals (`trim = false`), `G1` and `F` written only when they change,
 `M06T#` and `G43H#` with the tool's number, no comments. What phase 4a still has to settle (see the implementation log):
 the generator's own `SpindleOn` event also reaches `on_command` (`M3 S18000` after the template's `S18000M03`), the
-generator's `M5` before a change doubles the template's `?stop_spindle_before_tool_change: M5`, the rack slot numbers
-(phase 3), and `{Z:park}` writes the current height rather than a park height of the machine.
+generator's `M5` before a change doubles the template's `?stop_spindle_before_tool_change: M5`, and `{Z:park}` writes the
+current height rather than a park height of the machine. The rack slot numbers came with phase 3: with the machine's tool
+rack set, `M06T{tool.number}` writes the slot.

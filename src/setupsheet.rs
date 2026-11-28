@@ -4,6 +4,7 @@
 use crate::i18n::{tr, tr_f};
 use crate::model::{ProjectData, Tool};
 use crate::pieces::PartOutput;
+use crate::program::{Event, NumberFrom, ToolRef};
 use crate::shapes;
 use crate::summary::{describe, duration};
 use crate::toolpath::Timing;
@@ -65,6 +66,18 @@ fn tools_in_order(data: &ProjectData) -> Vec<(&Tool, Vec<usize>)> {
             if matches!(o.p.kind.as_str(), "inlay" | "plug") { if let Some(t) = &o.p.tool2 { add(t, i + 1); } }
             if let Some(t) = o.p.flat_mill() { add(t, i + 1); }
             if o.p.kind == "pocket" { if let Some(t) = &o.p.rest { add(t, i + 1); } }
+        }
+    }
+    out
+}
+
+/// The tool numbers the programs write (the main one first, then the separate pieces): tool id and its resolved number and offset, as
+/// the generator resolved them (`toolnum`).
+fn slots(parts: &[PartOutput]) -> Vec<(String, ToolRef)> {
+    let mut out: Vec<(String, ToolRef)> = Vec::new();
+    for p in parts {
+        for e in &p.out.program.events {
+            if let Event::ToolChange { tool } = e { if !out.iter().any(|(id, _)| *id == tool.id) { out.push((tool.id.clone(), (**tool).clone())); } }
         }
     }
     out
@@ -159,19 +172,30 @@ ul.check{list-style:none;margin:0;padding:0}ul.check li{padding:3px 0 3px 26px;p
     h += &diagram(data);
     h += "</div>";
 
-    // the tools, in order
+    // the tools, in order; with a tool changer, or numbers from the rack or the tools, each tool's slot (T) and length offset (H)
     let tools = tools_in_order(data);
+    let slots = slots(parts);
+    let atc = crate::post::Post::caps(crate::post::for_job(&data.job)).tool_change == crate::post::ToolChangeMode::Atc;
+    let show_slots = atc || slots.iter().any(|(_, r)| r.from != NumberFrom::FirstUse);
     if !tools.is_empty() {
-        h += &format!("<h2>{}</h2><table><tr><th>#</th><th>{}</th><th>{}</th><th class=\"n\">{}</th><th class=\"n\">{}</th><th class=\"n\">{}</th><th class=\"n\">{}</th><th>{}</th></tr>", esc(tr("Tools, in the order they are used")), esc(tr("Tool")), esc(tr("Type")), esc(tr("Diameter")), esc(tr("Speed")), esc(tr("Feed")), esc(tr("Plunge")), esc(tr("Operations")));
+        let slot_head = if show_slots { format!("<th class=\"n\">{}</th><th class=\"n\">H</th>", esc(tr("Slot"))) } else { String::new() };
+        h += &format!("<h2>{}</h2><table><tr><th>#</th><th>{}</th>{slot_head}<th>{}</th><th class=\"n\">{}</th><th class=\"n\">{}</th><th class=\"n\">{}</th><th class=\"n\">{}</th><th>{}</th></tr>", esc(tr("Tools, in the order they are used")), esc(tr("Tool")), esc(tr("Type")), esc(tr("Diameter")), esc(tr("Speed")), esc(tr("Feed")), esc(tr("Plunge")), esc(tr("Operations")));
         for (i, (t, used)) in tools.iter().enumerate() {
             let pen = t.shape == "pen";
-            h += &format!("<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td>{}</td></tr>",
+            let slot = if !show_slots { String::new() } else {
+                match slots.iter().find(|(id, _)| *id == t.id) {
+                    Some((_, r)) => format!("<td class=\"n\">T{}</td><td class=\"n\">H{}</td>", r.number, r.offset()),
+                    None => "<td class=\"n\">-</td><td class=\"n\">-</td>".to_string(),
+                }
+            };
+            h += &format!("<tr><td>{}</td><td>{}</td>{slot}<td>{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td>{}</td></tr>",
                 i + 1, esc(&t.name), esc(shape_name(&t.shape)), match units { Units::Metric => format!("{} mm", trim(t.dia, 3)), Units::Imperial => len(t.dia, units) },
                 if pen { "-".to_string() } else { format!("{} rpm", trim(t.rpm, 0)) }, feed(t.feed, units), feed(t.plunge, units),
                 used.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "));
         }
         h += "</table>";
-        if tools.len() > 1 { h += &format!("<p class=\"sub\">{}</p>", esc(tr("The program stops for each tool change. Touch off Z0 again with the new tool before you resume."))); }
+        if atc { h += &format!("<p class=\"sub\">{}</p>", esc(tr("The machine changes the tools itself: check that each tool is in its slot and its length offset (H) is measured before you start."))); }
+        else if tools.len() > 1 { h += &format!("<p class=\"sub\">{}</p>", esc(tr("The program stops for each tool change. Touch off Z0 again with the new tool before you resume."))); }
     }
 
     // the operations
@@ -252,6 +276,33 @@ mod tests {
         let s = sheet(Units::Imperial, true);
         assert!(s.contains(" in\u{a0}") || s.contains(" in<") || s.contains(" in "), "no inches");
         assert!(s.contains("in/min") && !s.contains("mm/min"), "feeds are not in inches");
+    }
+
+    #[test]
+    fn rack_slots_and_offsets_are_listed_for_a_tool_changer_or_numbered_tools() {
+        let rack = || crate::load_project(include_str!("../tests/data/rack_two_tools.project.json")).unwrap().data;
+        let sheet = |d: &ProjectData| html(d, &generate_parts(d, Units::Metric).unwrap(), Units::Metric, &SheetInfo { version: "0".into() }, "t");
+        // Mach3 / LinuxCNC with a rack: slots 5 and 7, H the slot number
+        let s = sheet(&rack());
+        assert!(s.contains("<th class=\"n\">Slot</th><th class=\"n\">H</th>") && s.contains(">T5</td><td class=\"n\">H5<") && s.contains(">T7</td><td class=\"n\">H7<"), "{s}");
+        assert!(s.contains("in its slot") && !s.contains("The program stops for each tool change"));
+        // a tool changer without a rack still lists the numbers it writes (order of first use)
+        let mut d = rack();
+        d.machine.as_mut().unwrap().tool_table.clear();
+        let s = sheet(&d);
+        assert!(s.contains(">T1</td>") && s.contains(">T2</td>"));
+        // GRBL with a rack: the numbers came from the rack, so they are listed
+        d = rack();
+        d.job.post = String::new();
+        let s = sheet(&d);
+        assert!(s.contains(">T5</td>") && s.contains("The program stops for each tool change"));
+        // GRBL without any number: as before
+        d.machine.as_mut().unwrap().tool_table.clear();
+        let s = sheet(&d);
+        assert!(!s.contains("Slot") && !s.contains(">T1</td>"));
+        // a number on one tool is enough to list them
+        d.tools[1].number = Some(4);
+        assert!(sheet(&d).contains(">T4</td>"));
     }
 
     #[test]

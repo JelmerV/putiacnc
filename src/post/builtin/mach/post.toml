@@ -11,6 +11,7 @@ line_ending = "lf"
 arcs = "xy"
 max_arc_sweep = 180
 tool_change = "atc"       # T# M6, no stop for the operator; the machine stands still at the change
+tool_numbers = "first_use" # a tool with no rack slot or number of its own is numbered by order of first use, as always
 length_offset = false     # no G43 H#: the controller's own tool-change macro handles the length
 spindle = "controlled"
 dwell = "seconds"
