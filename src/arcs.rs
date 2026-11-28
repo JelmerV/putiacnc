@@ -93,7 +93,15 @@ fn txt(v: f64) -> String { let v = if v == 0.0 { 0.0 } else { v }; format!("{}",
 /// Rewrite `lines` with arcs. `dec` is the number of decimals of the output, `k` the length of one output unit in mm (1 for mm, 25.4 for
 /// inches); the limits above are in mm, so in output units they are divided by `k`. Returns the new lines and how many arcs were written.
 pub fn fit_arcs(lines: &[String], dec: usize, k: f64) -> (Vec<String>, usize) {
+    let (out, _, n) = fit_arcs_mapped(lines, dec, k);
+    (out, n)
+}
+
+/// `fit_arcs`, also giving for each new line the index of the line of `lines` it comes from: itself for a line that is kept, the
+/// first line of the run it replaces for an arc. The indices only grow.
+pub fn fit_arcs_mapped(lines: &[String], dec: usize, k: f64) -> (Vec<String>, Vec<usize>, usize) {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut from: Vec<usize> = Vec::with_capacity(lines.len());
     let mut pos: Option<[f64; 2]> = None;
     let mut arcs = 0;
     let mut i = 0;
@@ -121,6 +129,7 @@ pub fn fit_arcs(lines: &[String], dec: usize, k: f64) -> (Vec<String>, usize) {
                 if p[0].is_finite() && p[1].is_finite() { pos = Some(p); }
             }
             out.push(l.clone());
+            from.push(i);
             i += 1;
             continue;
         }
@@ -145,6 +154,7 @@ pub fn fit_arcs(lines: &[String], dec: usize, k: f64) -> (Vec<String>, usize) {
                     let mut l = format!("{} X{} Y{} I{} J{}", if cw { "G2" } else { "G3" }, txt(e[0]), txt(e[1]), txt(ci), txt(cj));
                     if let Some(f) = &run[a].1 { l += &format!(" F{f}"); }
                     out.push(l);
+                    from.push(i + a);
                     arcs += 1;
                     a = b;
                     written = true;
@@ -152,13 +162,14 @@ pub fn fit_arcs(lines: &[String], dec: usize, k: f64) -> (Vec<String>, usize) {
             }
             if !written {
                 out.push(lines[i + a].clone());
+                from.push(i + a);
                 a += 1;
             }
         }
         i += run.len();
         pos = Some(*pts.last().unwrap());
     }
-    (out, arcs)
+    (out, from, arcs)
 }
 
 #[cfg(test)]
@@ -198,6 +209,20 @@ mod tests {
             }
         }
         assert!((p[0] - 62.0).abs() < 1e-3 && (p[1] - 40.0).abs() < 1e-3, "ends where it started");
+    }
+
+    #[test]
+    fn each_line_says_where_it_comes_from() {
+        let l = circle_lines(50.0, 40.0, 12.0, 120);
+        let (o, from, n) = fit_arcs_mapped(&l, 3, 1.0);
+        assert_eq!((o.clone(), n), fit_arcs(&l, 3, 1.0));
+        assert_eq!(from.len(), o.len());
+        assert!(from.windows(2).all(|w| w[0] < w[1]), "{from:?}");
+        // kept lines point at themselves; the first arc starts with the first cut of the circle (line 2, after the rapid and the plunge)
+        for (j, line) in o.iter().enumerate() { if !line.starts_with("G2") && !line.starts_with("G3") { assert_eq!(*line, l[from[j]]); } }
+        let first_arc = o.iter().position(|x| x.starts_with("G3 ")).unwrap();
+        assert_eq!(from[first_arc], 2);
+        assert_eq!(*from.last().unwrap(), l.len() - 1);
     }
 
     #[test]

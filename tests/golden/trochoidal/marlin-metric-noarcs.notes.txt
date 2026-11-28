@@ -1,0 +1,1 @@
+Trochoidal loops written as 505 G2/G3 arcs: run an air cut first if this machine has not done arcs before.

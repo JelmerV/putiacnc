@@ -11,6 +11,8 @@ One directory per project:
 - every `*.project.json` under `examples/` (named after the file, e.g. `oval-sign/`);
 - every built-in sample of Generate → Sample projects (`sample-name-plate/`, `sample-box/`, `sample-relief/`,
   `sample-shaped-relief/`, `sample-oval/`).
+- the option cases (`opt-*/`, `pause/`, `pen/`, `pen-tool-change/`, `rest-pocket/`, `trochoidal/`, `photo-vcarve/`,
+  `plug-piece/`): emitter paths the matrix does not reach, see "Option cases" below.
 
 Each project runs on a fixed machine (the app's default machine: 300 × 200 × 60 mm, rapid 2000 mm/min, safe Z 5 mm,
 no line numbers, no machine limits), so nothing depends on the local setup. The machine is applied the way the app
@@ -29,13 +31,46 @@ File names: `<dialect>-<units>-<arcs>[-tool-<n>].nc`
 
 The text is what `putia-gcode -o` and File → Export G-code write (`pieces::generate_parts`, `split::generate_files`,
 including the summary header from `summary::add_header`), with no newline added at the end. A project with inlay plugs
-on a separate piece would also get `-plug` files, as the export names them (none of today's projects has one).
+on a separate piece also gets `-plug` files, as the export names them (the `plug-piece/` case below).
 
 Next to each `.nc` is a `.notes.txt`: the generator's notes (`Output.notes`), one per line. Warnings are behaviour too;
 an empty file means "no notes".
 
 A G-code file over 1 MB would be stored as `<name>.nc.digest` instead (SHA-256, size, line count, the first and last
 200 lines). None is that large today.
+
+## Option cases
+
+The matrix puts the same fixed machine on every project, and none of the projects above pauses, draws with a pen or
+uses some of the other operations, so parts of the emitter never show in it. A short list of explicit cases in
+`tests/golden.rs` (`cases()`) covers them, each in its own directory and with the same file names. They were
+added before phase 1 of the spec (the emitter refactor), from the unchanged generator. Every case runs in all 5
+dialects, metric, arcs off, unless the table says otherwise; each also writes the per-tool files when it has more
+than one tool.
+
+| Directory | Project | What it covers |
+|---|---|---|
+| `opt-numbered/` | small two-tool job (below) | line numbers (`Machine.numbered`), arcs off and on: numbering runs after arc fitting, and again after the summary header and split comments |
+| `opt-start-end-code/` | small two-tool job | the machine's own start and end lines (`start_code` / `end_code`), with a comment line Marlin rewrites to `;`, blank lines and spaces that are dropped |
+| `opt-start-end-code-numbered/` | small two-tool job | both: numbering covers the inserted lines |
+| `opt-wcs-g56-spin0/` | small two-tool job | `job.wcs` = 2 (G56) and a spin-up of 0 s (no `G4` after `M3`) |
+| `opt-wcs-g59-1/` | small two-tool job | `job.wcs` = 6: G59.1 on Mach3 / LinuxCNC, G54 on the dialects that do not have it |
+| `pause/` | `tests/data/hardware_m0_aircut.project.json` | an operation pause with the spindle running (`M5`, `M0` with the message), a pause that ends a per-tool file |
+| `pen/` | `tests/data/hardware_pen_test.project.json`, with a pen-down dwell of 0.125 s on operation 2 | pen drawing (`select_pen`, `draw_op`, `G4 P0.13` with 2 decimals), a pause with no spindle running; metric **and imperial** (the draw comment gives the pen heights in the output units) |
+| `pen-tool-change/` | small two-tool job with a pause (default message) after operation 1 and a pen drawing between the cutters | `select_pen` after a cutter, `select_tool` after the pen, the default pause message |
+| `rest-pocket/` | a 60 x 40 mm pocket, 6 mm cutter with a 2 mm Corners tool (as `PUTIACNC_SHOW_REST` makes it) | the pocket rest pass (`rest_pass`, "corners and narrow parts") |
+| `trochoidal/` | `tests/data/pocket_island.project.json` with trochoidal clearing, as `tests/trochoidal.rs` sets it | with arcs off, only the loops are fitted as G2/G3 (the per-range fitter) |
+| `photo-vcarve/` | a gradient picture, as `tests/photo_vcarve.rs` makes it | photo V-carve |
+| `plug-piece/` | an inlay with its plug on a separate 8 mm piece, as the tests in `src/pieces.rs` make it | the `-plug` file of `pieces::generate_parts` |
+
+The small two-tool job is made in code (`small_job`): a 60 x 40 x 6 mm stock, a 3 mm cutter round a 15 x 10 mm
+rectangle, then a 6 mm cutter inside a 16 mm circle, 1 mm deep in one pass, no ramp. The relief detail pass (the
+third tool of a relief, `tests/data/relief-ledges.project.json`) is not a case: `sample-relief/` already has it, and
+that file alone would add 2 MB.
+
+Two things these files show that are today's behaviour, kept as they are: on Marlin the pen's dwell is written as
+`G4 P..` (Marlin has `G4`, but the spindle wait is left out there), and on Marlin the `-plug` file's header still
+says "Stock", because `pieces.rs` looks for `(Stock ` after Marlin has turned the comment into `; Stock`.
 
 ## Regenerating
 
