@@ -19,7 +19,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # objc2 0.4 (through eframe 0.27) does not compile with Rust 1.100 on macOS: stay on 1.99 there until eframe is updated
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -72,7 +72,7 @@ jobs:
           shoot "${{ matrix.name }}-3d.png" "$IN" PUTIACNC_THEME=light PUTIACNC_OP=2 PUTIACNC_VIEW=3d PUTIACNC_PLAY=1.0 PUTIACNC_FRACTIONS=1 PUTIACNC_HIDE=machine,toolpaths
           ls -la shots
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: screenshots-${{ matrix.name }}
