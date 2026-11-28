@@ -20,7 +20,7 @@ jobs:
     if: ${{ inputs.draft }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Make the draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,7 +45,7 @@ jobs:
     # the oldest runner on purpose: an AppImage runs on systems with the same glibc or newer
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build tools
         run: |
@@ -71,7 +71,7 @@ jobs:
           sleep 12
           kill -0 "$pid" || { echo "the AppImage exited early"; exit 1; }
           kill "$pid"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-appimage
           path: |
@@ -98,14 +98,14 @@ jobs:
     if: ${{ !cancelled() && needs.draft.result != 'failure' }}
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # objc2 0.4 (through eframe 0.27 / winit 0.29) does not compile with Rust 1.100: stay on 1.99 until eframe is updated
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
       - name: Build the dmg
         run: sh ./packaging/build-dmg.sh
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-dmg
           path: PutiaCNC-*-macos.dmg
@@ -132,7 +132,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p putiacnc-gui
@@ -144,7 +144,7 @@ jobs:
           cp target/release/putiacnc.exe "$D/PutiaCNC.exe"
           cp LICENSE THIRD-PARTY-LICENSES.txt README.md "$D/"
           7z a "$D.zip" "$D"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-zip
           path: PutiaCNC-*-windows-x86_64.zip
