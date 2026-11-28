@@ -3,7 +3,7 @@
 //! and the fix, and so is a `format_version` this engine does not know.
 use super::template::{self, Handler, Origin, Template, Word};
 use super::text::Format;
-use super::{ArcSupport, Caps, CommentStyle, DwellUnit, LineEnding, PostError, PropDef, PropKind, PropValue, SpindleCtl, ToolChangeMode};
+use super::{ArcSupport, Caps, CommentStyle, DwellUnit, LineEnding, PostError, PropDef, PropKind, PropValue, SpindleCtl, ToolChangeMode, ToolNumbers};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use toml::Spanned;
@@ -82,6 +82,7 @@ struct CapsToml {
     arcs: Option<ArcSupport>,
     max_arc_sweep: Option<Spanned<f64>>,
     tool_change: Option<ToolChangeMode>,
+    tool_numbers: Option<ToolNumbers>,
     length_offset: Option<bool>,
     spindle: Option<SpindleCtl>,
     dwell: Option<DwellUnit>,
@@ -226,8 +227,10 @@ impl Package {
         if let Some((w, at)) = wcs {
             if !(1..=9).contains(&w) { return Err(fail(Some(at), format!("caps.wcs_count = {w}: give 1 (one fixed system) to 9 (G54 to G59.3)"))); }
         }
+        let tool_change = c.tool_change.unwrap_or(d.tool_change);
         let caps = Caps {
-            arcs: c.arcs.unwrap_or(d.arcs), max_arc_sweep: sweep.map_or(d.max_arc_sweep, |s| s.0), tool_change: c.tool_change.unwrap_or(d.tool_change),
+            arcs: c.arcs.unwrap_or(d.arcs), max_arc_sweep: sweep.map_or(d.max_arc_sweep, |s| s.0), tool_change,
+            tool_numbers: c.tool_numbers.unwrap_or(match tool_change { ToolChangeMode::Atc => ToolNumbers::Required, ToolChangeMode::Manual => ToolNumbers::FirstUse }),
             length_offset: c.length_offset.unwrap_or(d.length_offset), spindle: c.spindle.unwrap_or(d.spindle), dwell: c.dwell.unwrap_or(d.dwell),
             comments: c.comments.unwrap_or(d.comments), wcs_count: wcs.map_or(d.wcs_count, |w| w.0), max_line_len: c.max_line_len.or(d.max_line_len),
         };
@@ -359,4 +362,21 @@ impl super::Post for Package {
     fn caps(&self) -> &Caps { &self.caps }
     fn properties(&self) -> &[PropDef] { &self.props }
     fn render(&self, prog: &crate::program::Program, ctx: &super::PostCtx) -> Result<super::Rendered, PostError> { self.render_program(prog, ctx) }
+    fn read_back(&self, units: crate::model::Units) -> crate::verify::ReadBack {
+        use crate::verify::{Comments, Dwell, ReadBack};
+        let inch = units == crate::model::Units::Imperial;
+        let dec = |w: Word| self.words[w.idx()].format.decimals(inch);
+        ReadBack {
+            comments: match self.caps.comments { CommentStyle::Paren => Comments::Paren, CommentStyle::Semicolon => Comments::Semicolon, CommentStyle::None => Comments::None },
+            // the engine writes I and J from the arc's start only (an absolute centre is refused at load)
+            ij_incremental: true,
+            numbered: false,
+            motion_always: self.always.iter().all(|a| *a),
+            dwell: match self.caps.dwell { DwellUnit::Seconds => Dwell::Seconds, DwellUnit::Milliseconds => Dwell::Milliseconds, DwellUnit::None => Dwell::None },
+            decimals: [dec(Word::X), dec(Word::Y), dec(Word::Z)],
+            // the coarser of the two (fewer decimals: the larger rounding)
+            ij_decimals: match (dec(Word::I), dec(Word::J)) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) },
+            pens: vec![],
+        }
+    }
 }

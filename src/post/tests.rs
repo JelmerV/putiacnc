@@ -4,6 +4,7 @@
 use super::*;
 use crate::model::Units;
 use crate::program::{ArcTo, CommentKind, DwellWhy, Event, Meta, Program, ToolRef, Xyz};
+use super::ToolNumbers;
 use std::sync::LazyLock;
 
 static MACHINE: LazyLock<Machine> = LazyLock::new(Machine::default);
@@ -18,8 +19,8 @@ fn text(d: Dialect, prog: &Program) -> String { render(d, prog).lines.join("\n")
 fn pkg(body: &str) -> Package { Package::load("t.toml", &format!("[post]\nformat_version = 1\nname = \"T\"\n{body}")).unwrap_or_else(|e| panic!("{e}")) }
 fn load_err(body: &str) -> PostError { Package::load("t.toml", &format!("[post]\nformat_version = 1\nname = \"T\"\n{body}")).unwrap_err() }
 
-fn tool(n: u32, name: &str) -> Event {
-    Event::ToolChange { tool: Box::new(ToolRef { id: format!("t{n}"), name: name.into(), number: n, length_offset: None, dia: 3.175, shape: "flat".into() }) }
+fn tool(n: u16, name: &str) -> Event {
+    Event::ToolChange { tool: Box::new(ToolRef { id: format!("t{n}"), name: name.into(), number: n, length_offset: None, from: crate::program::NumberFrom::FirstUse, dia: 3.175, shape: "flat".into() }) }
 }
 fn c(text: &str, kind: CommentKind) -> Event { Event::Comment { text: text.into(), kind } }
 fn rapid(x: Option<f64>, y: Option<f64>, z: Option<f64>) -> Event { Event::Rapid { to: Xyz::new(x, y, z) } }
@@ -728,7 +729,8 @@ fn every_builtin_loads_and_renders_the_test_program() {
 fn the_builtins_capabilities() {
     let caps = |d| builtin(d).caps().clone();
     for d in [Dialect::Grbl, Dialect::GrblHal, Dialect::FluidNc] { assert_eq!(caps(d), Caps::default(), "{d:?}"); }
-    assert_eq!(caps(Dialect::Mach), Caps { tool_change: ToolChangeMode::Atc, wcs_count: 9, ..Caps::default() });
+    // Mach3 / LinuxCNC changes tools itself but numbers them by first use (phase 3: `tool_numbers = "first_use"` in its manifest)
+    assert_eq!(caps(Dialect::Mach), Caps { tool_change: ToolChangeMode::Atc, tool_numbers: ToolNumbers::FirstUse, wcs_count: 9, ..Caps::default() });
     assert_eq!(caps(Dialect::Marlin), Caps { spindle: SpindleCtl::Manual, dwell: DwellUnit::Milliseconds, comments: CommentStyle::Semicolon, wcs_count: 1, ..Caps::default() });
     // the work offset as Job::wcs_name gave it for each dialect
     for (post, _) in crate::model::DIALECTS {
@@ -925,4 +927,32 @@ mod generated {
         assert!(n.lines.iter().all(|l| l.starts_with('N')));
         assert!(serde_json::from_str::<ProjectData>(&serde_json::to_string(&d).unwrap()).unwrap().job.marlin());
     }
+}
+
+#[test]
+fn tool_numbers_default_by_the_tool_change_and_can_be_set() {
+    assert_eq!(pkg("").caps.tool_numbers, ToolNumbers::FirstUse);
+    assert_eq!(pkg("[caps]\ntool_change = \"manual\"").caps.tool_numbers, ToolNumbers::FirstUse);
+    assert_eq!(pkg("[caps]\ntool_change = \"atc\"").caps.tool_numbers, ToolNumbers::Required);
+    assert_eq!(pkg("[caps]\ntool_change = \"atc\"\ntool_numbers = \"first_use\"").caps.tool_numbers, ToolNumbers::FirstUse);
+    assert_eq!(pkg("[caps]\ntool_numbers = \"required\"").caps.tool_numbers, ToolNumbers::Required);
+    let e = load_err("[caps]\ntool_numbers = \"rack\"");
+    assert_eq!(e.line, Some(5), "{e}");
+    assert!(e.message.contains("first_use") && e.message.contains("required"), "{e}");
+    assert_eq!(builtin(Dialect::Mach).caps().tool_numbers, ToolNumbers::FirstUse);
+}
+
+#[test]
+fn the_read_back_description_comes_from_the_package() {
+    use crate::verify::{Comments, Dwell, ReadBack};
+    // the built-ins: what verify read before it had a description
+    let rb = builtin(Dialect::Grbl).read_back(Units::Metric);
+    assert_eq!(rb, ReadBack::default());
+    assert_eq!(builtin(Dialect::Mach).read_back(Units::Imperial), ReadBack { decimals: [Some(4); 3], ij_decimals: Some(4), ..ReadBack::default() });
+    assert_eq!(builtin(Dialect::Marlin).read_back(Units::Metric), ReadBack { comments: Comments::Semicolon, dwell: Dwell::Milliseconds, ..ReadBack::default() });
+    // a TX-35-style package: modal G1, no comments, no dwell, 3 padded decimals in mm (and in inches: not a length format)
+    let tx = pkg("[caps]\ncomments = \"none\"\ndwell = \"none\"\n[format]\nxyz = { decimals = 3, trim = false }\nfine = { decimals = 4 }\n[words]\nX = { format = \"xyz\", modal = true }\nY = { format = \"xyz\", modal = true }\nZ = { format = \"xyz\", modal = true }\nI = { format = \"fine\" }\nJ = { format = \"xyz\" }\n[modal]\nmotion = { codes = [\"G0\", \"G1\", \"G2\", \"G3\"], always = [\"G0\", \"G2\", \"G3\"] }");
+    let want = ReadBack { comments: Comments::None, motion_always: false, dwell: Dwell::None, decimals: [Some(3); 3], ij_decimals: Some(3), ..ReadBack::default() };
+    assert_eq!(tx.read_back(Units::Metric), want);
+    assert_eq!(tx.read_back(Units::Imperial), want);
 }

@@ -286,6 +286,20 @@ pub struct Machine {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub junction: Option<f64>,
     /// How stiff the machine is, for the feeds and speeds suggestion: "light" (also when empty), "medium" or "heavy" (`feeds::RIGIDITY`).
     #[serde(default, skip_serializing_if = "String::is_empty")] pub rigid: String,
+    /// The machine's tool rack: which tool sits in which slot (`T#`) and its length offset register (`H#`). The slot belongs to the
+    /// machine, not the tool: the same cutter can be slot 3 here and slot 7 on another machine. Empty = no rack (`toolnum`).
+    #[serde(default, rename = "toolTable", skip_serializing_if = "Vec::is_empty")] pub tool_table: Vec<ToolSlot>,
+}
+
+/// One slot of a machine's tool rack (`Machine.tool_table`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolSlot {
+    /// The tool's id (`Tool.id`).
+    pub tool_id: String,
+    /// The slot: the tool number the program writes (`T#`).
+    pub number: u16,
+    /// The length offset register (`H#`) of this slot; `None` = the slot number.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub length_offset: Option<u16>,
 }
 
 impl Machine {
@@ -315,7 +329,7 @@ impl Machine {
 impl Default for Machine {
     fn default() -> Self {
         Machine { id: String::new(), name: "My CNC machine".into(), rapid: 2000.0, tsc: 1.2, x: 300.0, y: 200.0, z: 60.0, notes: String::new(),
-                  post: Some(String::new()), numbered: Some(false), safe: Some(5.0), rpm_min: None, rpm_max: None, feed_max: None, plunge_max: None, inches: Some(false), arcs: Some(false), spin_up: Some(2.0), start_code: None, end_code: None, holder: None, holder_on: false, rigid: String::new(), accel: None, accel_y: None, accel_z: None, rate: None, rate_y: None, rate_z: None, junction: None }
+                  post: Some(String::new()), numbered: Some(false), safe: Some(5.0), rpm_min: None, rpm_max: None, feed_max: None, plunge_max: None, inches: Some(false), arcs: Some(false), spin_up: Some(2.0), start_code: None, end_code: None, holder: None, holder_on: false, rigid: String::new(), accel: None, accel_y: None, accel_z: None, rate: None, rate_y: None, rate_z: None, junction: None, tool_table: vec![] }
     }
 }
 
@@ -347,6 +361,11 @@ pub struct Tool {
     #[serde(default, skip_serializing_if = "is_zero")] pub stick: f64,
     /// Pen: the colour of its ink as "#rrggbb" (shown in the 3D preview and the tool lists); `None` = the usual dark ink.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub color: Option<String>,
+    /// The tool's own default tool number (`T#`), used when the machine's tool table (`Machine.tool_table`) does not list it (`None` =
+    /// none: an ATC post that needs one refuses to export, the others number by order of first use). See `toolnum`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub number: Option<u16>,
+    /// The tool's own default length offset register (`H#`) for `G43`, with `number` (`None` = the resolved tool number).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub length_offset: Option<u16>,
 }
 
 impl Tool {

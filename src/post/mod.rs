@@ -33,6 +33,19 @@ pub trait Post: Send + Sync {
     /// The user's options (Fusion's `properties`), edited in the machine manager.
     fn properties(&self) -> &[PropDef];
     fn render(&self, prog: &Program, ctx: &PostCtx) -> Result<Rendered, PostError>;
+    /// How the post writes its text, for `verify` to read it back in these units: plain data, so that the read-back shares no code
+    /// with the post. The generator adds what the program decides (line numbers, which tools are pens).
+    fn read_back(&self, units: crate::model::Units) -> crate::verify::ReadBack;
+}
+
+/// The property that asks a tool-changer post to stop the spindle (`M5`) before every `M6`; with it on, the export checks the text
+/// for it (`verify::AtcCheck`). A well-known name, so the check does not depend on a template.
+pub const STOP_SPINDLE_BEFORE_TOOL_CHANGE: &str = "stop_spindle_before_tool_change";
+
+/// The value of a bool property: the machine's (`PostCtx.props`), else the post's default; false when the post has no such property
+/// (or it is not a bool).
+pub fn bool_prop(post: &dyn Post, props: &BTreeMap<String, PropValue>, key: &str) -> bool {
+    match props.get(key).or_else(|| post.properties().iter().find(|p| p.key == key).map(|p| &p.default)) { Some(PropValue::Bool(b)) => *b, _ => false }
 }
 
 /// What the controller can do. The generator reads it before it generates (which events it emits); the post reads it while it
@@ -43,6 +56,8 @@ pub struct Caps {
     /// Degrees; the fitter writes no arc longer than this (at most 180).
     pub max_arc_sweep: f64,
     pub tool_change: ToolChangeMode,
+    /// How tools get their numbers when neither the machine's tool table nor the tool gives one (`toolnum::resolve`).
+    pub tool_numbers: ToolNumbers,
     /// The post writes `G43 H#` itself after a tool change (default `on_section_tool` with `tool_change = "atc"`).
     pub length_offset: bool,
     pub spindle: SpindleCtl,
@@ -56,7 +71,7 @@ pub struct Caps {
 
 impl Default for Caps {
     fn default() -> Caps {
-        Caps { arcs: ArcSupport::Xy, max_arc_sweep: 180.0, tool_change: ToolChangeMode::Manual, length_offset: false, spindle: SpindleCtl::Controlled,
+        Caps { arcs: ArcSupport::Xy, max_arc_sweep: 180.0, tool_change: ToolChangeMode::Manual, tool_numbers: ToolNumbers::FirstUse, length_offset: false, spindle: SpindleCtl::Controlled,
                dwell: DwellUnit::Seconds, comments: CommentStyle::Paren, wcs_count: 6, max_line_len: None }
     }
 }
@@ -92,6 +107,18 @@ pub enum ToolChangeMode {
     Manual,
     /// The controller changes the tool itself (`T# M6`): no stop, and the machine stands still at the change.
     Atc,
+}
+
+/// Tool numbers for tools that neither the machine's tool table nor the tool itself numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolNumbers {
+    /// Order of first use in the program (1, 2, 3...), skipping numbers taken by numbered tools. The default with
+    /// `tool_change = "manual"`, and the built-in Mach3 / LinuxCNC (an ATC post that always numbered this way).
+    FirstUse,
+    /// Every used tool must have a number (rack slot or tool number), else the export stops naming the tools without one: loading
+    /// the wrong cutter is worse than not exporting. The default with `tool_change = "atc"`.
+    Required,
 }
 
 /// Who runs the spindle.
@@ -213,10 +240,10 @@ pub fn stop_message(line: &str) -> Option<&str> {
 /// for a manual tool change and a manual spindle, no spin-up wait without spindle control or dwell): two tools, an operation each,
 /// passes, a requested dwell, an arc, an operator stop and the end. For linting a post and for its "Test post" view.
 pub fn test_program(caps: &Caps) -> Program {
-    use crate::program::{ArcTo, CommentKind, DwellWhy, Event, Meta, ToolRef, Xyz};
+    use crate::program::{ArcTo, CommentKind, DwellWhy, Event, Meta, NumberFrom, ToolRef, Xyz};
     let manual_spindle = caps.spindle == SpindleCtl::Manual;
     let wait = !manual_spindle && caps.dwell != DwellUnit::None;
-    let tool = |n: u32, name: &str, dia: f64| Event::ToolChange { tool: Box::new(ToolRef { id: format!("t{n}"), name: name.into(), number: n, length_offset: None, dia, shape: "flat".into() }) };
+    let tool = |n: u16, name: &str, dia: f64| Event::ToolChange { tool: Box::new(ToolRef { id: format!("t{n}"), name: name.into(), number: n, length_offset: None, from: NumberFrom::Tool, dia, shape: "flat".into() }) };
     let c = |text: &str, kind| Event::Comment { text: text.into(), kind };
     let mut ev = vec![c("PutiaCNC - test program", CommentKind::Info), c("Stock 100 x 50 x 12 mm; XY0 = lower-left corner of stock, Z0 = top surface", CommentKind::Info), Event::Setup];
     let start_at = ev.len();

@@ -12,6 +12,8 @@ pub mod history;
 pub mod selection;
 pub mod summary;
 pub mod verify;
+pub mod crosscheck;
+pub mod toolnum;
 pub mod cleanup;
 pub mod clip;
 pub mod grblsettings;
@@ -45,7 +47,7 @@ pub mod toolpath;
 pub mod trim;
 
 pub use model::{ProjectFile, ProjectData, Units};
-pub use toolpath::{generate, Output};
+pub use toolpath::{generate, generate_with, Output};
 
 /// Load a project file exported by the browser app (or by this crate).
 pub fn load_project(json: &str) -> Result<ProjectFile, String> {

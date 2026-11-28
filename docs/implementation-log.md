@@ -526,3 +526,255 @@ Mach3 / LinuxCNC read `P` as seconds, so their output stays as it was. Phases 0 
   built-ins' seconds); `marlin_metric` and `the_builtins_capabilities` updated; `tests/replay.rs`
   `a_pens_rest_is_read_in_the_unit_of_the_controller` (a pen rest of 0.25 s on GRBL, Mach3 and Marlin: the text, and a 0.25 s
   wait in the replay on all three; it fails with 250 s on Marlin without the replay change).
+
+## Phase 3: tool numbers, the tool rack and the verify upgrades
+
+Tools get their numbers (`T#`) and length offsets (`H#`) from the machine's tool rack, the tool, or the order of first use;
+`verify` reads the final text with a description of the post's format; the export stops when the text's moves are not the
+program's (the motion cross-check) or a tool-changer program is unsafe (the ATC checks). The GUI parts (the "Tool rack" tab
+in the machine manager, the slot in the tool manager) are phase 4b; here the GUI only compiles. Gate: no existing golden or
+snapshot changed; two new golden cases.
+
+### What moved where
+
+- `src/model.rs`: `Tool.number`, `Tool.length_offset` (`Option<u16>`, JSON `number`, `length_offset`); `Machine.tool_table:
+  Vec<ToolSlot>` (JSON `toolTable`) with `ToolSlot { tool_id, number, length_offset }`. All `default` and
+  `skip_serializing_if`, so old projects, machine lists and tool libraries load and save byte for byte (below). Field names
+  inside are the spec's (snake case), only the table itself is renamed, as the spec writes it.
+- `src/program.rs`: `ToolRef.number: u16`, `length_offset: Option<u16>` (always `Some` after resolution), new `ToolRef.from:
+  NumberFrom { Rack, Tool, FirstUse }` (the setup sheet lists slots by it), `ToolRef::offset()`, `Xyz::mask()`.
+- `src/post/mod.rs`: `Caps.tool_numbers: ToolNumbers { FirstUse, Required }`; `Post::read_back(units) -> verify::ReadBack`;
+  `STOP_SPINDLE_BEFORE_TOOL_CHANGE` (the well-known property name) and `bool_prop` (the machine's value, else the package's
+  default). `manifest.rs` reads `[caps] tool_numbers` (default `required` with `atc`, `first_use` with `manual`) and builds
+  the read-back description. `builtin/mach/post.toml`: `tool_numbers = "first_use"`.
+- `src/toolnum.rs` (new): `resolve(used, machine, mode)`: the resolution rules, the skip, the missing and duplicate errors.
+- `src/verify.rs`: `ReadBack`, `Fact`, `TextMove`, `read(lines, rb, sink)` (the old `trace` is `read` with the default
+  description and no sink), `AtcExpect` / `AtcCheck`.
+- `src/crosscheck.rs` (new): `Tol`, `Checker`: the cross-check, fed by `verify::read`.
+- `src/toolpath.rs`: `generate_with(data, units, post, props)` (`generate` calls it with the job's built-in and no
+  properties; tests pass test packages and wrappers); `Em.used` (the tools changed to, in order); after the walk the numbers
+  are resolved and written into every `ToolChange`; the "no length offsets" note; `read_back()` runs hazards, cross-check and
+  ATC checks in one pass over the post's lines.
+- `src/setupsheet.rs`: Slot and H columns.
+- `src/arcs.rs`: `ON_CIRCLE` is public (the cross-check allows the fitter's own tolerance).
+- `tests/golden.rs`: cases `rack` and `rack-first-use` (Mach3 only); `Case.posts`; `on_machine` keeps the project's rack.
+  `tests/data/rack_two_tools.project.json` (new): `two_ops_toolchange` on a Mach3 machine with `toolTable` T5 / T7.
+- `tests/tool_rack.rs` (new), `tests/fixtures/old-format/` (a machine list and a tool library store as `main` saved them).
+
+### Resolution (`toolnum::resolve`)
+
+First match wins: (1) the machine's `tool_table` entry for the tool id (first entry if the table lists it twice), (2)
+`Tool.number`, (3) order of first use, only with `tool_numbers = "first_use"`; first-use numbers skip every number taken by
+a tool of *this program* resolved in (1) or (2) (a slot of a tool the program does not use is not taken). With `required`,
+every tool that reaches (3) is named in one error. Two different used tools on one number is an error with every post,
+GRBL and Marlin included (their text writes no number, but the setup sheet would list a clash). The length offset: the rack
+entry's own when the number came from the rack, else `Tool.length_offset`, else the number.
+
+**Where, and why not in `select_tool`.** The task asked for resolution in `select_tool` / `select_pen`. The skip needs every
+tool the program uses, including the ones used later, which `select_tool` does not know yet. So `Em::tool_change` records
+the tool (first use order, as `ToolSt.ids` did) with the old first-use number, and `generate` resolves all of them once the
+walk is done, before rendering, and writes number, offset and source into each `ToolChange`. Nothing between reads the
+number (`Move.stop`, the times and the trochoidal windows do not), and without numbers the result is the old order of first
+use by construction (the goldens prove it).
+
+**The machine.** Generation reads the project's copy of the machine (`ProjectData.machine`), as for every other machine
+setting. The machine manager's list and the project's copy are two places: phase 4b's "Tool rack" tab must write the rack to
+both (as `apply_machine_job` copies the other settings), or a project keeps an old rack.
+
+**Split files.** Each file of a split program is generated on its own, so it is resolved on its own: with `first_use`, the
+1/8" end mill is T2 in the whole `rack-first-use` program and T1 in its own file (golden). With rack slots the numbers are
+the same everywhere; with `required` it cannot happen.
+
+### The capability `tool_numbers`
+
+`[caps] tool_numbers = "first_use" | "required"`, default `required` with `tool_change = "atc"`, `first_use` with
+`"manual"`. The built-in Mach3 / LinuxCNC is an ATC post that sets `first_use`, so a Mach3 job without a rack keeps its
+numbers and gets no new note (the trap of phase 2). The spec's "ATC without length offsets" warning comes only with
+`required` (and more than one tool), so no golden note changed.
+
+### The read-back description, and why it is independent
+
+`verify::ReadBack` is plain data: comment style, I/J incremental, line numbers, motion codes always or modal, the dwell
+unit, the decimals of X/Y/Z and I/J in the output units, and the tool numbers that are pens. The package builds it from its
+manifest (`Post::read_back`), the generator adds `numbered` and `pens` from the program. `verify` parses the text itself and
+uses nothing of `toolpath`, `post/engine.rs`, `template.rs` or `text.rs` (it formats its numbers with `{}`, not
+`toolpath::num`), so a mistake in the code that writes the text is not repeated by the code that reads it. What changed in the
+reader, none of which changes a hazard of any built-in program (goldens, snapshots, random projects):
+
+- **Words without spaces** were already read (`words` scans letter + number), as were modal lines (the last G0-G3 stays);
+  now tested on lines of `tests/data/tx35/vcarve/logo.nc` (read-only): `G1X74.934Y70.699Z8.200`, `X76.242Y69.401`, `M06T11`,
+  `G43H11`, `S18000M03`, `M3S14000`, `G0Z14.280`.
+- **G91** no longer ends the reading: relative moves are passed over (their axes unknown) until `G90`; **G28 / G30** make the
+  position unknown. The TX-35 header `G0 G28 G91` … `G90` is read past instead of stopping everything at line 1.
+- **G4 P** is added up in the post's unit (`Trace.dwell_s`).
+- **Pens**: besides the `(Pen:` comment, an `M6` with a pen's tool number (`ReadBack.pens`) sets the pen state, for a post
+  that writes no comments.
+- Comments: `(…)` and `;…` are read as comments in every style (controllers read both; the GRBL built-ins write `M0 ; message`
+  with the paren style). The style is in the description for the pen rule and for later.
+
+`read` reports `Fact`s in one pass (T, M6, spindle on/off, G43 H, a move in another frame, each move with its line, text,
+from/to in mm, centre, whether it wrote a motion code, spindle and pen state); facts of a line come before its move, as a
+controller runs them. Hazards, cross-check and ATC checks all come from this one pass.
+
+### The motion cross-check (`crosscheck::Checker`)
+
+Inside `generate()`, on the post's lines (before `summary::add_header`, `split` and `pieces` add text; each split file and
+plug piece is generated separately and checked on its own). The program's motion events are walked in order: `Rapid`,
+`Feed`, `Arc`, and the `ProgramEnd` park (the first lift and the park have no `Move`, so the events are the reference).
+Pairing is by order; the source map is used only to pass over the machine's own start and end code (lines with source
+`None`, which no event describes); axes such a line moved count as unknown until a post line writes them again, and a note
+says when the machine's code has moves.
+
+- A text move matches the next program move when every axis both know is within the tolerance, every axis the event gives is
+  in the text, and both are rapids or both cuts.
+- A program move that goes nowhere at the output's resolution may be missing (a feed-only `G1 F800`, a modal word that does not
+  change); a text move that goes nowhere may be extra (`G0{Z:park}`).
+- A text arc against an `Arc` event: one for one, end, centre (I/J tolerance plus the start's) and direction. A text arc
+  where the program has cuts is a fitted arc: it takes the program's cuts one by one, each on the arc within the fit
+  tolerance and going its way (the sign of the cross product, allowing `r × fit`), until one ends where the arc ends.
+- With `motion_always` (every built-in), a move line without a motion code is an error.
+- Tolerance per axis: `0.5 × 10^-decimals × k + 1e-9` mm (0.0005 mm for 3 decimals, 0.00127 mm for 4-decimal inches). The fit
+  tolerance: `arcs::ON_CIRCLE` (0.005 mm, the fitter's own: it puts the rounded points that close to a circle through the
+  rounded start) `+ √2 × (axis + 2 × ij)` (the program's point against its rounded form, and the text centre rounded on each
+  axis, which moves both the centre and the radius measured from the start).
+- The first mismatch is the error: `G-code line N (text): the text goes to X… Y… Z…, but the program's next move is a cut to
+  X… Y… Z… (mm). Export stopped: …`. A program move left over at the end (one that goes somewhere) is an error too.
+
+### The ATC checks (`verify::AtcCheck`)
+
+When `caps.tool_change = "atc"`, on the same facts, blocking like the cross-check:
+
+- with `stop_spindle_before_tool_change` on (`PostCtx.props`, else the package's default; false when the package has no such
+  property): no `M6` while the spindle runs (an `M3`/`M4` with no `M5`/`M2`/`M30` since);
+- with `caps.length_offset`: after every `M6`, a `G43` whose `H` is that tool's `ToolRef.offset()`, before the first line that
+  writes Z (a `G53` machine Z, `G53 G0 Z0`, is not a work Z move and is allowed);
+- the spindle runs before every cutting move (G1-G3), except while a pen draws (the pen rule);
+- the `T` in effect at the k-th `M6` is the k-th `ToolChange`'s number, there are as many `M6` as `ToolChange` events, and every
+  `T` word is a number of one of the program's tools. "Each T word in order" taken literally would refuse a pre-selected next
+  tool (`T{next_tool.number}` after `M6`, the spec's `preselect_next_tool`), so a stray `T` is checked against the program's
+  tools instead.
+
+The built-in Mach3 passes all of them unchanged (no property, `length_offset = false`; its pens are told by the comment).
+
+### Setup sheet
+
+The tools table gets Slot and H columns (`T5`, `H5`) when the job's post is an ATC post or a number came from the rack or the
+tool (`ToolRef.from`), read from the programs' `ToolChange` events (so they are exactly what the G-code writes). With an ATC
+post the sentence under the table says the machine changes tools itself (check slots and measured offsets) instead of "The
+program stops for each tool change". Otherwise unchanged (the existing tests pass unchanged).
+
+### Old files
+
+`git diff` of the saved bytes: every `tests/data/*.project.json` and `examples/projects/*.project.json` loaded and saved
+(`save_project`), a machine list (`Machines::to_json`) and a tool library store (`ToolLibs::to_json`) were written once by
+`main` (9381123) and once by this branch: `diff -r` empty. The machine list and the tool library store as `main` saved them
+are committed in `tests/fixtures/old-format/` (outside `tests/data`, so the golden gate's diff stays the new cases only), and
+`tests/tool_rack.rs` requires them back byte for byte; the projects must save without any of the new keys and save again to
+the same bytes.
+
+### Timing
+
+Release build (LTO), this 4-core container, `cargo run --release --example gen_time`, `main` (9381123) and this branch built
+side by side and run alternately, two rounds; median of 9 runs (5 for the big ones).
+
+| Program | main | branch | branch / main |
+|---|---|---|---|
+| sample-shaped-relief (GRBL, mm, arcs off): 7,541 lines | 0.128 / 0.128 s | 0.126 / 0.127 s | 0.98 / 0.99 |
+| `BUSY=60`: 1,051,919 lines, 1,049,748 moves, arcs off | 1.359 / 1.352 s | 1.379 / 1.375 s | 1.01 / 1.02 |
+| the same with arcs on (196,343 lines) | 1.466 / 1.510 s | 1.501 / 1.506 s | 1.02 / 1.00 |
+
+The cross-check alone, timed on the same outputs (a temporary example, not committed): the read-back pass that `main` already
+ran for the hazards takes 0.257 s on the million lines; with the cross-check fed from it, 0.268 s (+0.011 s, 0.8 % of
+`generate()`). With arcs on, 0.058 s against 0.098 s (+0.040 s, 2.7 %: every fitted point is checked against its arc). Far
+under the 15 % limit; the whole of `generate()` is within the run-to-run noise. The one pass (hazards, cross-check, ATC checks
+from the same `Fact`s) is what keeps it there: a second parse of the text would have cost about as much as the first.
+
+### Equivalence beyond the goldens
+
+Phase 2's run repeated with a temporary test (not committed) that `include!`s `tests/random_projects.rs`: seeds 0 to 299, all 5
+dialects, mm and inch, arcs off and on, with phase 2's corners (a third of the projects with a tool named "X5 Y-3 cutter", a
+quarter with a pause "move X10 Y2 away (clamp)" on every operation, a seventh with start and end code). Each file holds the
+G-code, the notes, the time, cutting time and length, the move count and every `Move.stop` flag. `main` and this branch: 6,000
+files each, `diff -r` empty. 100 are the same refusal ("No toolpath …", the tool does not fit) on both sides, as in phase 2;
+no program tripped the cross-check or the ATC checks (1,345,140 arc lines and 13,848 stop lines among them).
+
+### Gate: what was run
+
+- `cargo test --workspace`: 48 test binaries, 796 passed, 0 failed, 11 ignored (phase 2: 47 binaries, 743).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `git diff --stat origin/main -- tests/golden tests/data` (9381123; the local `main` ref in this container was stale): only the
+  new files (`tests/golden/rack/`, `tests/golden/rack-first-use/`, six files each, `tests/data/rack_two_tools.project.json`) and
+  the two new rows of `tests/golden/README.md`; no existing golden, notes file or snapshot changed.
+- CLI: `putia-gcode tests/data/rack_two_tools.project.json -o …`: exit 0, "480 lines, cutting 5594.2 mm, estimated 8.5 min",
+  no `note:` lines, `T5 M6 (Tool 5: 1/8in flat end mill)` and `T7 M6 (Tool 7: 6 mm flat end mill)` (no `H`: the built-in Mach3
+  writes no `G43`), the same bytes as `tests/golden/rack/mach-metric-noarcs.nc`. The same project with both tools in slot 5:
+  exit 1, "error: Two tools have the same tool number … T5 (1/8″ flat end mill, 6 mm flat end mill) …", no file written. The
+  CLI cannot load a post package yet (phase 4a), so the missing-slot case with the test ATC package is a test
+  (`a_tool_missing_from_the_rack_stops_the_export_naming_it`).
+- UI: `cargo build -p putiacnc-gui`; `scripts/shot.sh -e PUTIACNC_TAB_GCODE=1 tests/data/rack_two_tools.project.json`: the
+  G-code tab shows "Output for Mach3 / LinuxCNC", "G-code (480 lines)" and `T5 M6 (Tool 5: 1/8in flat end mill)` after `G0 Z5`;
+  the status bar 480 lines and 5594.2 mm, as the CLI.
+
+### Tests added in phase 3
+
+- `src/toolnum.rs`: table over tool number over first use (and the first table entry), first use alone, the skip (and a slot
+  of an unused tool not taken), the length offset default and its overrides, missing numbers named with `required`, a clash
+  with every mode (and no clash for unused slots).
+- `src/verify.rs`: the TX-35 read-back on `logo.nc` (G28 / G53 lost, `M06T11`, `M3S14000`, `G43 H11`, no-space and modal
+  moves, `S18000M03`, `M30`, the one real hazard); relative moves passed over; dwells in seconds and milliseconds; absolute
+  arc centres; the pen by comment and by tool number; each ATC check passing (also on `logo.nc`) and failing: M6 with the
+  spindle running (only with the property; `logo.nc` fails at line 903), a missing, wrong or H-less G43, a cut with the spindle
+  off (and a pen that may), a wrong T, a T that is not a tool, an M6 with no T, too few and too many M6.
+- `src/crosscheck.rs`: the program's own text passes; a dropped move, two swapped moves, a move mis-scaled by 25.4 (one word and
+  a whole program), a rapid for a cut, an extra and a missing move are caught; inch output passes at the rounding limit (both
+  ways) and fails one unit beyond; a fitted arc passes, a centre 0.05 mm off and the wrong direction fail, an arc ending early
+  hands the rest to the next arc, an arc past the run fails; an `Arc` event one for one (centre, direction, a line for it);
+  moves that go nowhere missing or extra; a missing motion code with `motion_always`; the machine's own code passed over.
+- `src/post/tests.rs`: `tool_numbers` defaults and values (and the load error); the built-ins' read-back descriptions and a
+  TX-35-style one; Mach3's caps with `first_use`.
+- `src/setupsheet.rs`: Slot and H for Mach3 with a rack and without, for GRBL with a rack or a numbered tool, none for GRBL
+  without numbers.
+- `tests/tool_rack.rs`: old files (projects, machine list, tool library); the new fields' names and round trip; rack slots in
+  Mach3's text and the program; tool number and first-use skip through `generate`; GRBL and Marlin resolve but write the same
+  text; a slot clash with every built-in; the test ATC package (TX-35-like: required, `G43H#`, modal, padded, no comments,
+  arcs off and on) writes `M06T5`/`G43H5`, `M06T7`/`G43H17` and passes its checks; a tool missing from the rack (named, both
+  named, a tool number is enough); a clash; the length-offset note only with `required`; the test posts that must fail: one
+  that exchanges X and Y (GRBL and Mach3), one that swaps two moves, one that drops `G43`, one that writes `T{tool.offset}`
+  with an offset that differs, one that changes tools with the spindle running (the package default, the property off, a
+  package without the property and the property set directly), one that writes mm numbers under G20; and the cross-check
+  pairing every text move of a real program.
+- `tests/golden.rs`: `rack`, `rack-first-use`; `all_is_every_dialect`.
+
+### Open problems
+
+- **Split files and first-use numbers**: each file is numbered on its own, so with `first_use` a tool can be T2 in the whole
+  program and T1 in its own file (`rack-first-use` shows it). Harmless for Mach3 today (it numbered this way before), but
+  worth a note in phase 4b's export window when a split ATC job has tools without slots.
+- **`ToolChange` events of split files** say nothing about the other files' tools; the setup sheet reads the whole program and
+  the plug pieces, so its slots are the whole program's.
+- **The source map decides which lines are the machine's code** for the cross-check. The engine writes it, not the templates,
+  so a package cannot lie in it; a Rhai post (phase 5) must not be able to set it either.
+- **`G53` and `G28` lines** are not checked against anything (no event describes them). A post that writes `G53 G0 Z-50` would
+  pass the cross-check; only the "nolift" hazard and the first work move's Z catch some of that.
+- `AtcCheck` treats a `T` word in a stop message of a comment-free post as a tool selection (verify reads the text as a
+  controller does, and `M0 T5 ...` would be read as `T5` by most controllers too). The built-ins put messages in comments.
+
+### Traps for phase 4a
+
+- **The TX-35 header.** `verify` now reads past `G0 G28 G91` (relative until `G90`) and `G53 G0 Z0` (Z unknown), but the
+  "nolift" hazard fires for VCarve's `G54 X0 Y0` right after `G53 G0 Z0`, because a machine-coordinate lift says nothing about
+  the work height. The spec's ordering (the first tool and `G0 Z…` before `G54 X0 Y0`) avoids it; keep that order.
+- **`stop_spindle_before_tool_change`** is read by name from `PostCtx.props`, else the package's default. When the machine
+  manager saves property values (phase 4a), pass them to `generate_with` (`generate` passes none). The TX-35's `M5` before
+  `M06` is checked in the text, so the generator's own `SpindleOff` and the template's `?…: M5` may both be there; only one is
+  needed.
+- **`{Z:park}`** writes the current height: the cross-check treats that line as a move that goes nowhere. A park height of the
+  machine (a real Z move at the end) needs an event (`ProgramEnd.park` with Z), or the cross-check refuses the text.
+- **Pre-selecting the next tool** (`T{next_tool.number}` after `M06`) passes the T check (every T is a tool of the program, the T
+  in effect at each `M6` is the right one); a pre-select that comes *after* the next tool's `M6` would not.
+- **User posts in inch**: a package whose formats are not lengths writes mm numbers under `G20`; the cross-check refuses it
+  (test `a_post_that_writes_mm_numbers_in_an_inch_program_fails`), so phase 4a's "refuse inch for user posts" is now a
+  friendlier message rather than a safety need.
+- `Post` has a new required method `read_back`; any new `Post` implementation must describe its text.
+- The GUI must keep the machine list and the project's machine copy in step for `toolTable` (phase 4b), as for every other
+  machine setting.
