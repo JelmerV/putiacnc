@@ -1,5 +1,5 @@
 # Marlin on a machine whose board does not run the spindle: the program stops and asks the operator to start and stop it.
-# Byte for byte what PutiaCNC wrote before posts were packages (tests/golden).
+# Byte for byte what PutiaCNC wrote before posts were packages (tests/golden), except the dwell: G4 P is now in milliseconds.
 
 [post]
 format_version = 1
@@ -13,7 +13,7 @@ max_arc_sweep = 180
 tool_change = "manual"
 length_offset = false
 spindle = "manual"        # no M3 / M5: stops that ask the operator, and no wait for the spindle
-dwell = "seconds"         # kept as PutiaCNC wrote it (G4 P<seconds>); Marlin reads P as milliseconds, see the implementation log
+dwell = "milliseconds"    # Marlin's G4 reads P as milliseconds (S would be seconds): a pen's 0.13 s dwell is G4 P130
 comments = "semicolon"    # (text) is written as ; text, also in the machine's own start and end code
 wcs_count = 1             # no coordinate systems to pick: the operator sets the zero with G92
 
@@ -21,7 +21,7 @@ wcs_count = 1             # no coordinate systems to pick: the operator sets the
 xyz = { decimals = 3, inch_decimals = 4, length = true }
 feed = { decimals = 1, inch_decimals = 2, length = true }
 rpm = {}
-seconds = {}
+milliseconds = { decimals = 0 }   # whole milliseconds, as Marlin reads P: seconds x 1000 is not always a whole number (2.01 s gives 2009.9999999999998)
 
 [words]
 X = { format = "xyz", mode = "as_given" }
@@ -31,7 +31,7 @@ I = { format = "xyz", incremental = true }
 J = { format = "xyz", incremental = true }
 F = { format = "feed", mode = "as_given" }
 S = { format = "rpm" }
-P = { format = "seconds" }
+P = { format = "milliseconds" }
 
 [modal]
 motion = { codes = ["G0", "G1", "G2", "G3"], always = ["G0", "G1", "G2", "G3"] }

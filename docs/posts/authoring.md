@@ -53,7 +53,7 @@ The generator reads the capabilities **before** it generates, so they decide whi
 | `tool_change` | `manual`, `atc` | `manual`: a stop with "Change tool to …, then touch off Z0 and resume" before each change. `atc`: no stop; the machine stands still at the change (the next move starts from rest in the time estimate). |
 | `length_offset` | `false`, `true` | With `atc`, the default `on_section_tool` adds `G43 H{tool.offset}`. |
 | `spindle` | `controlled`, `manual` | `manual`: no spindle commands and no spin-up wait; the program stops and asks the operator to start the spindle (and to stop it before a pause, a tool change and at the end). |
-| `dwell` | `seconds`, `milliseconds`, `none` | The unit of `{P}`. `none`: no spin-up wait, and `{P}` has no value. |
+| `dwell` | `seconds`, `milliseconds`, `none` | The unit of `{P}`. `milliseconds`: seconds × 1000, for controllers whose `G4` reads `P` as milliseconds (Marlin); give `P` a format with `decimals` (the Marlin built-in has `decimals = 0`), as seconds × 1000 is not always a whole number in floating point. `none`: no spin-up wait, and `{P}` has no value. |
 | `comments` | `paren`, `semicolon`, `none` | How comment lines are written (see Templates). |
 | `wcs_count` | `6` | Work offsets the controller has: 1 to 9. The job's choice beyond that is written as G54. |
 | `max_line_len` | none | A longer line stops the export. |
