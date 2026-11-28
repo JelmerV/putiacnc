@@ -21,6 +21,12 @@ CI (`.github/workflows/ci.yml`) runs both on every push to `main` and every pull
   machine's start/end code, work offsets, pauses, pen drawing, rest machining, trochoidal loops, photo V-carve, plug
   pieces). `UPDATE_GOLDEN=1 cargo test --test golden` rewrites them; see
   `tests/golden/README.md`. This is the gate for the post-processor refactor (`docs/post-processor-spec.md`, phase 0).
+- **Posts** (`src/post/tests.rs`, `src/post/template.rs`, `src/post/text.rs`, `tests/arc_fitter.rs`): the post engine and the
+  built-in packages: each handler, word mode, number format, the motion group, `?` lines, filters and comment styles, every
+  load error with its line, the render errors, a lint of every built-in (loads, renders `post::test_program` in mm and
+  inches), and the TX-35 manifest as `docs/post-processor-spec.md` shows it. `tests/arc_fitter.rs` compares the engine's
+  arc fitting on the events with the old text fitter on every golden project. To try a package by hand:
+  `cargo run --example check_post -- path/to/post.toml` (or `builtin:grbl`), see `docs/posts/authoring.md`.
 - **Replay** (`tests/replay.rs`, `tests/common`): the G-code text is played back the way the 3D preview does it (steps with their line, arcs cut into short pieces, stops, waits, tools) and held to what the generator says: cutting length, time, end point, the passes and their lowest Z, the second tool, the levelling lap. Every random project goes through the same check.
 - **Random projects** (`tests/random_projects.rs`): projects built from a seed (stock, tools, one to three operations
   of every kind including inlay, shapes with holes, a random machine) go through the generator and the independent

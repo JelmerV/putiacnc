@@ -1,0 +1,60 @@
+# grblHAL: what GRBL gets (the same file with another name).
+# Byte for byte what PutiaCNC wrote before posts were packages (tests/golden).
+
+[post]
+format_version = 1
+name = "grblHAL"         # written in the first comment: (PutiaCNC - grblHAL)
+extension = "nc"
+line_ending = "lf"
+
+[caps]
+arcs = "xy"               # G2/G3 in the XY plane (fitted when the machine has arcs switched on, and always for trochoidal loops)
+max_arc_sweep = 180
+tool_change = "manual"    # the program stops and asks the operator to change the tool
+length_offset = false
+spindle = "controlled"    # M3 / M5
+dwell = "seconds"         # G4 P<seconds>: the wait for the spindle to come up to speed, and a pen's dwell
+comments = "paren"
+wcs_count = 6             # G54 to G59
+
+[format]
+xyz = { decimals = 3, inch_decimals = 4, length = true }   # trailing zeros dropped: X12.7, X0
+feed = { decimals = 1, inch_decimals = 2, length = true }
+rpm = {}                  # as it is: S18000
+seconds = {}              # as the program gives it: P2, P0.13
+
+[words]
+X = { format = "xyz", mode = "as_given" }   # written when the move gives the axis (it changed)
+Y = { format = "xyz", mode = "as_given" }
+Z = { format = "xyz", mode = "as_given" }
+I = { format = "xyz", incremental = true }
+J = { format = "xyz", incremental = true }
+F = { format = "feed", mode = "as_given" }  # written when the feed changed, and after a tool change or a pause
+S = { format = "rpm" }
+P = { format = "seconds" }
+
+[modal]
+motion = { codes = ["G0", "G1", "G2", "G3"], always = ["G0", "G1", "G2", "G3"] }   # every move writes its code
+
+[templates]
+# metric or imperial, absolute, XY plane, feed per minute, the work coordinate system: nothing is left over from before
+on_open = "{units} G90 G17 G94 {wcs}"
+on_section = ""           # the operation is described by the comments the generator writes
+on_section_end = ""
+on_section_tool = "(Tool: {tool.name|comment})"   # the stop before it asked the operator to change the tool
+on_rapid = "{G} {X} {Y} {Z}"
+on_linear = "{G} {X} {Y} {Z} {F}"
+on_circular = "{G} {X} {Y} {I} {J} {F}"
+on_dwell = "G4 {P}"
+# senders such as gSender drop (bracketed) comments before sending and show a ; comment instead, so a stop says it after ;
+on_command = """
+?spindle_on: M3 {S}
+?spindle_off: M5
+?stop: M0 ; {message}
+?optional_stop: M1 ; {message}
+"""
+on_comment = "({text})"
+on_close = """
+G0 {X:park} {Y:park}
+M2
+"""

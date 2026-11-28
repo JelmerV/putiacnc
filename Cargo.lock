@@ -2364,6 +2364,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sys-locale",
+ "toml",
  "ttf-parser",
  "usvg",
  "visioncortex",

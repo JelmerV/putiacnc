@@ -1,9 +1,12 @@
 //! Arc output: runs of short straight cutting moves that lie on a circle are written as one G2/G3 line.
 //!
-//! The G-code is rewritten after it is generated, line by line, in the output units. Only runs of `G1` moves that change X and Y
-//! alone are looked at; everything else (rapids, plunges, ramps, spindle and comment lines) passes through unchanged. A run becomes an
-//! arc only when its points sit on one circle within a very small tolerance AND each straight piece is already a fine approximation
-//! of that circle, so a coarse polygon (a hexagon, say) is never turned into a circle.
+//! The fitter works on the program line by line, in the output units, with the numbers as they are written (rounded). Its core,
+//! [`fit_items`], takes each line as an [`Item`]: a `G1` that changes X and/or Y alone (a cut), or anything else with the X and Y it
+//! gives. The post engine builds the items from the program's events (`crate::post`), so any post format gets arcs; [`fit_arcs`]
+//! builds them by reading text lines, as the generator did before the IR. Only runs of cuts are looked at; everything else
+//! (rapids, plunges, ramps, spindle and comment lines) passes through unchanged. A run becomes an arc only when its points sit on
+//! one circle within a very small tolerance AND each straight piece is already a fine approximation of that circle, so a coarse
+//! polygon (a hexagon, say) is never turned into a circle.
 
 /// Points must lie this close to the fitted circle (mm).
 const ON_CIRCLE: f64 = 0.005;
@@ -19,8 +22,10 @@ fn words(line: &str) -> Vec<(char, &str)> {
     line.split_whitespace().filter_map(|w| { let mut c = w.chars(); c.next().map(|k| (k, c.as_str())) }).collect()
 }
 
-/// X/Y of the move on this line, if it is a plain linear or arc move word set.
-fn xy(line: &str) -> (Option<f64>, Option<f64>) {
+/// The X and Y words of a line, as the fitter reads any line that is not a cut: every whitespace-separated word that starts with X
+/// or Y and parses as a number, whatever the line is (a stop message "M0 ; move X10 away" gives X10), except a line that starts with
+/// `(`. The post engine reads the non-move lines of a program with this too, so that it fits exactly what the text fitter fitted.
+pub fn xy(line: &str) -> (Option<f64>, Option<f64>) {
     if line.starts_with('(') { return (None, None); }
     let mut x = None; let mut y = None;
     for (k, v) in words(line) {
@@ -29,23 +34,41 @@ fn xy(line: &str) -> (Option<f64>, Option<f64>) {
     (x, y)
 }
 
-/// A `G1` line that changes only X and/or Y (an F word is allowed): the point it goes to, and its F text.
-fn plain_cut(line: &str, pos: [f64; 2]) -> Option<([f64; 2], Option<String>)> {
+/// A `G1` line that changes only X and/or Y (an F word is allowed): the axes it gives, and its F text.
+fn plain_cut(line: &str) -> Option<(Option<f64>, Option<f64>, Option<&str>)> {
     let mut it = line.split_whitespace();
     if it.next()? != "G1" { return None; }
-    let (mut x, mut y, mut f) = (pos[0], pos[1], None);
-    let mut moved = false;
+    let (mut x, mut y, mut f) = (None, None, None);
     for w in it {
         let (k, v) = w.split_at(1);
         match k {
-            "X" => { x = v.parse().ok()?; moved = true; }
-            "Y" => { y = v.parse().ok()?; moved = true; }
-            "F" => f = Some(v.to_string()),
+            "X" => x = Some(v.parse().ok()?),
+            "Y" => y = Some(v.parse().ok()?),
+            "F" => f = Some(v),
             _ => return None,
         }
     }
-    if moved { Some(([x, y], f)) } else { None }
+    if x.is_some() || y.is_some() { Some((x, y, f)) } else { None }
 }
+
+/// One line of the program as the fitter sees it, with the numbers as written (output units, rounded).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Item {
+    /// A `G1` that changes only X and/or Y: the axes it gives (the others stay where they are), and whether it writes a feed. A feed in
+    /// the middle of a run starts a new run.
+    Cut { x: Option<f64>, y: Option<f64>, f: bool },
+    /// Any other line: the X and Y it gives (none for a comment, a spindle or a tool line).
+    Other { x: Option<f64>, y: Option<f64> },
+}
+
+impl Item {
+    fn xy(&self) -> (Option<f64>, Option<f64>) { match *self { Item::Cut { x, y, .. } | Item::Other { x, y } => (x, y) } }
+}
+
+/// An arc that replaces the items `first..=last` (all cuts): it ends at `end`, its centre is `ij` from its start (rounded to the
+/// decimals the fitter was given), clockwise or not. It writes the feed when the item `first` does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fitted { pub first: usize, pub last: usize, pub end: [f64; 2], pub ij: [f64; 2], pub cw: bool }
 
 fn circle3(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Option<([f64; 2], f64)> {
     let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
@@ -57,8 +80,8 @@ fn circle3(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Option<([f64; 2], f64)> {
     Some(([ux, uy], r))
 }
 
-/// Does `p[0..=n]` form one arc of at most half a circle? Returns (centre, clockwise).
-fn fit(p: &[[f64; 2]], k: f64) -> Option<([f64; 2], bool)> {
+/// Does `p[0..=n]` form one arc of at most `max_sweep` radians (half a circle at most)? Returns (centre, clockwise).
+fn fit(p: &[[f64; 2]], k: f64, max_sweep: f64) -> Option<([f64; 2], bool)> {
     let n = p.len();
     if n < 4 { return None; }
     let (c, r) = circle3(p[0], p[n / 2], p[n - 1])?;
@@ -83,12 +106,85 @@ fn fit(p: &[[f64; 2]], k: f64) -> Option<([f64; 2], bool)> {
             sweep += da;
         }
     }
-    if sweep.abs() > std::f64::consts::PI + 1e-9 { return None; }
+    if sweep.abs() > max_sweep + 1e-9 { return None; }
     Some((c, sign < 0.0))
 }
 
 fn fixed(v: f64, dec: usize) -> f64 { let f = 10f64.powi(dec as i32); (v * f).round() / f }
 fn txt(v: f64) -> String { let v = if v == 0.0 { 0.0 } else { v }; format!("{}", v) }
+
+/// The largest sweep of one arc for a post's `caps.max_arc_sweep` (degrees): half a circle at most, which is also what the fitter
+/// can check (it finds the circle through the first, middle and last point).
+pub fn max_sweep(degrees: f64) -> f64 {
+    if degrees >= 180.0 || !degrees.is_finite() { std::f64::consts::PI } else { degrees.max(1.0).to_radians() }
+}
+
+/// The arcs in `items`. `dec` is the number of decimals of the output (the centre offsets are rounded to it), `k` the length of one
+/// output unit in mm (1 for mm, 25.4 for inches; the limits above are in mm, so in output units they are divided by `k`),
+/// `max_sweep` the largest sweep of one arc in radians ([`max_sweep`]). The position is unknown until the items have given both X and
+/// Y; a run is only looked at from a known position. The arcs come in order and do not overlap.
+pub fn fit_items(items: &[Item], dec: usize, k: f64, max_sweep: f64) -> Vec<Fitted> {
+    let mut out = Vec::new();
+    let mut pos: Option<[f64; 2]> = None;
+    let mut run: Vec<[f64; 2]> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        // collect a run of plain cutting moves starting here
+        run.clear();
+        if let Some(start) = pos {
+            let mut cur = start;
+            let mut j = i;
+            while j < items.len() {
+                match items[j] {
+                    // a feed change in the middle of a run starts a new run
+                    Item::Cut { x, y, f } if !(j > i && f) => { let pt = [x.unwrap_or(cur[0]), y.unwrap_or(cur[1])]; run.push(pt); cur = pt; j += 1; }
+                    _ => break,
+                }
+            }
+        }
+        if run.len() < 3 {
+            let (x, y) = items[i].xy();
+            let mut p = pos.unwrap_or([f64::NAN, f64::NAN]);
+            if x.is_some() || y.is_some() {
+                if let Some(x) = x { p[0] = x; }
+                if let Some(y) = y { p[1] = y; }
+                if p[0].is_finite() && p[1].is_finite() { pos = Some(p); }
+            }
+            i += 1;
+            continue;
+        }
+        let start = pos.unwrap();
+        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(run.len() + 1);
+        pts.push(start);
+        pts.extend_from_slice(&run);
+        // greedy: the longest arc from point `a`
+        let mut a = 0;
+        while a + 1 < pts.len() {
+            let mut best: Option<(usize, [f64; 2], bool)> = None;
+            let mut b = a + 3;
+            while b < pts.len() {
+                match fit(&pts[a..=b], k, max_sweep) { Some((c, cw)) => { best = Some((b, c, cw)); b += 1; } None => break }
+            }
+            let mut written = false;
+            if let Some((b, c, cw)) = best {
+                let (s, e) = (pts[a], pts[b]);
+                let (ci, cj) = (fixed(c[0] - s[0], dec), fixed(c[1] - s[1], dec));
+                let r0 = (ci * ci + cj * cj).sqrt();
+                let r1 = ((e[0] - (s[0] + ci)).powi(2) + (e[1] - (s[1] + cj)).powi(2)).sqrt();
+                if (r0 - r1).abs() <= MAX_RADIUS_GAP / k {
+                    // the run's item j goes from pts[j] to pts[j + 1], so the arc from pts[a] to pts[b] replaces items a..b
+                    out.push(Fitted { first: i + a, last: i + b - 1, end: e, ij: [ci, cj], cw });
+                    a = b;
+                    written = true;
+                }
+            }
+            if !written { a += 1; }
+        }
+        i += run.len();
+        pos = Some(*pts.last().unwrap());
+    }
+    out
+}
 
 /// Rewrite `lines` with arcs. `dec` is the number of decimals of the output, `k` the length of one output unit in mm (1 for mm, 25.4 for
 /// inches); the limits above are in mm, so in output units they are divided by `k`. Returns the new lines and how many arcs were written.
@@ -98,78 +194,31 @@ pub fn fit_arcs(lines: &[String], dec: usize, k: f64) -> (Vec<String>, usize) {
 }
 
 /// `fit_arcs`, also giving for each new line the index of the line of `lines` it comes from: itself for a line that is kept, the
-/// first line of the run it replaces for an arc. The indices only grow.
+/// first line of the run it replaces for an arc. The indices only grow. The lines are read into [`Item`]s and fitted by
+/// [`fit_items`]; an arc is written `G2`/`G3` with X, Y, I and J, and the F word of the first line it replaces.
 pub fn fit_arcs_mapped(lines: &[String], dec: usize, k: f64) -> (Vec<String>, Vec<usize>, usize) {
+    let mut items: Vec<Item> = Vec::with_capacity(lines.len());
+    let mut feeds: Vec<Option<&str>> = Vec::with_capacity(lines.len());
+    for l in lines {
+        match plain_cut(l) {
+            Some((x, y, f)) => { items.push(Item::Cut { x, y, f: f.is_some() }); feeds.push(f); }
+            None => { let (x, y) = xy(l); items.push(Item::Other { x, y }); feeds.push(None); }
+        }
+    }
+    let arcs = fit_items(&items, dec, k, std::f64::consts::PI);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut from: Vec<usize> = Vec::with_capacity(lines.len());
-    let mut pos: Option<[f64; 2]> = None;
-    let mut arcs = 0;
     let mut i = 0;
-    while i < lines.len() {
-        // collect a run of plain cutting moves starting here
-        let mut run: Vec<([f64; 2], Option<String>)> = vec![];
-        if let Some(start) = pos {
-            let mut cur = start;
-            let mut j = i;
-            while j < lines.len() {
-                match plain_cut(&lines[j], cur) {
-                    // a feed change in the middle of a run starts a new run
-                    Some((pt, f)) if !(j > i && f.is_some()) => { run.push((pt, f)); cur = pt; j += 1; }
-                    _ => break,
-                }
-            }
-        }
-        if run.len() < 3 {
-            let l = &lines[i];
-            let (x, y) = xy(l);
-            let mut p = pos.unwrap_or([f64::NAN, f64::NAN]);
-            if x.is_some() || y.is_some() {
-                if let Some(x) = x { p[0] = x; }
-                if let Some(y) = y { p[1] = y; }
-                if p[0].is_finite() && p[1].is_finite() { pos = Some(p); }
-            }
-            out.push(l.clone());
-            from.push(i);
-            i += 1;
-            continue;
-        }
-        let start = pos.unwrap();
-        let mut pts: Vec<[f64; 2]> = vec![start];
-        pts.extend(run.iter().map(|r| r.0));
-        // greedy: the longest arc from point `a`
-        let mut a = 0;
-        while a + 1 < pts.len() {
-            let mut best: Option<(usize, [f64; 2], bool)> = None;
-            let mut b = a + 3;
-            while b < pts.len() {
-                match fit(&pts[a..=b], k) { Some((c, cw)) => { best = Some((b, c, cw)); b += 1; } None => break }
-            }
-            let mut written = false;
-            if let Some((b, c, cw)) = best {
-                let (s, e) = (pts[a], pts[b]);
-                let (ci, cj) = (fixed(c[0] - s[0], dec), fixed(c[1] - s[1], dec));
-                let r0 = (ci * ci + cj * cj).sqrt();
-                let r1 = ((e[0] - (s[0] + ci)).powi(2) + (e[1] - (s[1] + cj)).powi(2)).sqrt();
-                if (r0 - r1).abs() <= MAX_RADIUS_GAP / k {
-                    let mut l = format!("{} X{} Y{} I{} J{}", if cw { "G2" } else { "G3" }, txt(e[0]), txt(e[1]), txt(ci), txt(cj));
-                    if let Some(f) = &run[a].1 { l += &format!(" F{f}"); }
-                    out.push(l);
-                    from.push(i + a);
-                    arcs += 1;
-                    a = b;
-                    written = true;
-                }
-            }
-            if !written {
-                out.push(lines[i + a].clone());
-                from.push(i + a);
-                a += 1;
-            }
-        }
-        i += run.len();
-        pos = Some(*pts.last().unwrap());
+    for a in &arcs {
+        while i < a.first { out.push(lines[i].clone()); from.push(i); i += 1; }
+        let mut l = format!("{} X{} Y{} I{} J{}", if a.cw { "G2" } else { "G3" }, txt(a.end[0]), txt(a.end[1]), txt(a.ij[0]), txt(a.ij[1]));
+        if let Some(f) = feeds[a.first] { l += &format!(" F{f}"); }
+        out.push(l);
+        from.push(a.first);
+        i = a.last + 1;
     }
-    (out, from, arcs)
+    while i < lines.len() { out.push(lines[i].clone()); from.push(i); i += 1; }
+    (out, from, arcs.len())
 }
 
 #[cfg(test)]

@@ -3,8 +3,9 @@
 use crate::i18n::{tr, tr_f, tr_n, tr_nf};
 use crate::clip::{self, Path};
 use crate::model::*;
-use crate::program::{CommentKind, Dialect, DwellWhy, Event, Meta, Program, ToolRef, Xyz};
-pub use crate::program::render_canonical::{marlin_stop, number_lines, stop_line, stop_message};
+use crate::program::{CommentKind, DwellWhy, Event, Meta, Program, ToolRef, Xyz};
+use crate::post::{DwellUnit, Post, PostCtx, SpindleCtl};
+pub use crate::post::{number_lines, stop_message};
 
 const S: f64 = 1000.0;
 
@@ -57,7 +58,7 @@ pub fn is_no_shapes_note(note: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct Output {
-    /// The G-code text: the program as the canonical renderer writes it. `summary::add_header`, `split` and `pieces` edit these lines
+    /// The G-code text: the program as the job's post writes it. `summary::add_header`, `split` and `pieces` edit these lines
     /// afterwards (a header, file comments), so for their outputs the lines hold more than `program` renders.
     pub lines: Vec<String>,
     /// What the generator decided, as events (`program.rs`), before it was written as text.
@@ -225,7 +226,8 @@ impl ToolGeo {
 
 // ---------- emitter ----------
 /// The emitter: walks the toolpath and pushes events (`program.rs`). It decides which axes a move writes, when the feed is written,
-/// and keeps the move list and the time estimate; the text is written by the renderer afterwards.
+/// and keeps the move list and the time estimate; the post writes the text afterwards. What it emits depends on the post's
+/// capabilities (`crate::post::Caps`), never on which controller it is.
 struct Em {
     ev: Vec<Event>, cur: [f64; 3], lf: Option<f64>, time: f64, tc: f64, pn: usize, oi: usize, lap: bool, pw: Option<(usize, usize, bool)>,
     moves: Vec<Move>, last_ring: Option<(f64, Vec<[f64; 2]>)>, link_ok: bool,
@@ -234,7 +236,10 @@ struct Em {
     /// The number of events up to and including the last move: what comes after it is scanned for a halt.
     last_ev: usize,
     alt: bool, det: bool, marks: Vec<TabMark>, lead_skipped: usize, helix_skipped: usize, ox: f64, oy: f64, zt: f64, ku: f64, imp: bool, rap: f64, tsc: f64, spin: f64, rates: crate::motion::Rates, capped: usize,
-    marlin: bool, mach: bool,
+    /// `caps.spindle = manual`: the operator starts and stops the spindle when the program stops and asks.
+    manual_spindle: bool,
+    /// `caps.tool_change = atc`: the controller changes the tool itself (no stop for the operator), and the machine stands still there.
+    atc: bool,
 }
 
 impl Em {
@@ -263,7 +268,7 @@ impl Em {
             self.pw = Some((self.oi, self.pn, self.lap));
         }
         // the machine stops where, since the last move, the spindle starts or stops, it waits, pauses, or changes the tool itself
-        let stop = self.ev[self.last_ev.min(self.ev.len())..].iter().any(|e| e.halts(self.mach));
+        let stop = self.ev[self.last_ev.min(self.ev.len())..].iter().any(|e| e.halts(self.atc));
         self.ev.push(if is_cut { Event::Feed { to, feed: fd, write_feed } } else { Event::Rapid { to } });
         self.last_ev = self.ev.len();
         let dist = ((x - self.cur[0]).powi(2) + (y - self.cur[1]).powi(2) + (z - self.cur[2]).powi(2)).sqrt();
@@ -280,20 +285,28 @@ impl Em {
     fn comment(&mut self, kind: CommentKind, text: String) { self.ev.push(Event::Comment { text, kind }); }
     /// What an operation does, as a comment.
     fn op_comment(&mut self, text: String) { self.comment(CommentKind::Operation, text); }
-    /// A stop for the operator, with a message (the renderer writes it in the dialect's form).
+    /// A stop for the operator, with a message (the post writes it in its own form).
     fn stop(&mut self, msg: &str) { self.ev.push(Event::Stop { message: msg.to_string(), optional: false }); }
-    /// The spindle starts at `rpm`, or on a machine whose board has no spindle control, a stop that asks the operator to.
+    /// The spindle starts at `rpm`, or, when the operator runs the spindle (`caps.spindle = manual`), a stop that asks them to.
     fn spindle_on(&mut self, rpm: f64) {
-        if self.marlin { self.stop(&format!("Start the spindle at {} rpm, then resume", num(rpm))); } else { self.ev.push(Event::SpindleOn { rpm }); }
+        if self.manual_spindle { self.stop(&format!("Start the spindle at {} rpm, then resume", num(rpm))); } else { self.ev.push(Event::SpindleOn { rpm }); }
     }
-    /// The spindle stops, or nothing here on a Marlin machine (the stop that follows says it, or `spindle_off_by_hand` does).
-    fn spindle_off(&mut self) { if !self.marlin { self.ev.push(Event::SpindleOff); } }
-    /// Wait for the spindle to come up to speed (nothing when the machine's wait is 0). Counted in the time estimate.
+    /// The spindle stops, or nothing here when the operator runs it (the stop that follows says it).
+    fn spindle_off(&mut self) { if !self.manual_spindle { self.ev.push(Event::SpindleOff); } }
+    /// Wait for the spindle to come up to speed (nothing when the wait is 0: a machine set to 0 s, an operator who runs the spindle, a
+    /// controller that cannot dwell). Counted in the time estimate.
     fn spin_wait(&mut self) {
         if self.spin > 0.0 {
             self.ev.push(Event::Dwell { seconds: self.spin, why: DwellWhy::SpinUp });
             self.time += self.spin / 60.0;
         }
+    }
+    /// Closes the open operation: an `OperationEnd` after what it wrote, or, when it wrote nothing (no shapes, nothing to cut), no
+    /// operation at all (its `OperationStart` is taken back; nothing was pushed after it).
+    fn end_op(&mut self) {
+        let Some(i) = self.ev.iter().rposition(|e| matches!(e, Event::OperationStart { .. } | Event::OperationEnd { .. })) else { return };
+        let Event::OperationStart { index, .. } = self.ev[i] else { return };
+        if i + 1 == self.ev.len() { self.ev.pop(); } else { self.ev.push(Event::OperationEnd { index }); }
     }
     /// This tool is in the spindle from here on.
     fn tool_change(&mut self, tool: &Tool, number: usize) {
@@ -835,8 +848,11 @@ fn ring_from(pts: &[[f64; 2]], seg: usize, q: [f64; 2]) -> Vec<[f64; 2]> {
 fn flat_run(e: &mut Em, c: &OpCtx, pts: &[[f64; 2]], closed: bool, z: f64, loops: bool) {
     if let (true, Some((rl, adv))) = (loops, c.troch) {
         let t = trochoid(pts, rl, adv);
-        // the loops are circles, which the arc fitting of the renderer writes as G2/G3; a few events before them tell it where the tool is
-        let from = e.ev.len().saturating_sub(8).max(e.troch.last().map_or(0, |r| r.1));
+        // the loops are circles, which the post's arc fitting writes as G2/G3; the 8 events before them tell it where the tool is (8
+        // lines before the IR: the operation markers write no line, so they are not counted)
+        let floor = e.troch.last().map_or(0, |r| r.1);
+        let (mut from, mut n) = (e.ev.len(), 0);
+        while from > floor && n < 8 { from -= 1; if !e.ev[from].is_marker() { n += 1; } }
         for q in &t { e.feed(Some(q[0]), Some(q[1]), Some(c.z0 + z), c.feed); }
         e.troch.push((from, e.ev.len()));
         return;
@@ -1045,18 +1061,16 @@ fn zero_label(zr: &str) -> &'static str {
     match zr { "lr" => "lower-right corner", "ul" => "upper-left corner", "ur" => "upper-right corner", "c" => "center", _ => "lower-left corner" }
 }
 
-/// A tool's name as the G-code writes it in a comment: plain ASCII, no brackets (Mach3 and some LinuxCNC setups choke on more).
-pub(crate) fn tool_label(name: &str) -> String {
-    name.replace(['″', '"'], "in").replace(['(', ')'], "-").chars().filter(|c| c.is_ascii() && !c.is_ascii_control()).collect()
-}
+/// A tool's name as the G-code writes it in a comment: plain ASCII, no brackets (the posts' `comment` filter).
+pub(crate) fn tool_label(name: &str) -> String { crate::post::text::comment_text(name) }
 
-/// Which tool is in the spindle, and the Mach3 / LinuxCNC tool numbers (in order of first use).
+/// Which tool is in the spindle, and the tool numbers (in order of first use).
 #[derive(Default)]
 /// `r` is the spindle speed that is running; `None` while the spindle is stopped (the next tool selection starts it again).
 struct ToolSt { d: Option<f64>, r: Option<f64>, t: Option<String>, ids: Vec<String>, spun: bool }
 
 /// Emit what it takes to start cutting with `tool`: spindle start, or a tool change when another tool was in.
-fn select_tool(e: &mut Em, st: &mut ToolSt, mach: bool, tool: &Tool, sz: f64, dia_txt: &str, un: &str) {
+fn select_tool(e: &mut Em, st: &mut ToolSt, tool: &Tool, sz: f64, dia_txt: &str, un: &str) {
     if !st.ids.contains(&tool.id) { st.ids.push(tool.id.clone()); }
     let tno = st.ids.iter().position(|i| *i == tool.id).unwrap_or(0) + 1;
     let rpm = tool.rpm;
@@ -1069,9 +1083,9 @@ fn select_tool(e: &mut Em, st: &mut ToolSt, mach: bool, tool: &Tool, sz: f64, di
         Some(_) if st.t.as_deref() != Some(tool.id.as_str()) => {
             e.rapid(None, None, Some(sz));
             e.spindle_off();
-            // Mach3 / LinuxCNC change the tool themselves (T# M6); elsewhere the program stops for the operator to change it
-            if !mach {
-                let m = if e.marlin { format!("Stop the spindle and change tool to {} {}, then touch off Z0 and resume", dia_txt, un) } else { format!("Change tool to {} {}, then touch off Z0 and resume", dia_txt, un) };
+            // a controller with a tool changer changes the tool itself (caps.tool_change = atc); else the program stops for the operator
+            if !e.atc {
+                let m = if e.manual_spindle { format!("Stop the spindle and change tool to {} {}, then touch off Z0 and resume", dia_txt, un) } else { format!("Change tool to {} {}, then touch off Z0 and resume", dia_txt, un) };
                 e.stop(&m);
             }
             e.tool_change(tool, tno);
@@ -1088,7 +1102,7 @@ fn select_tool(e: &mut Em, st: &mut ToolSt, mach: bool, tool: &Tool, sz: f64, di
 /// if it ever ran), and a marker line the checker reads so that it does not call the moves "cutting with the spindle off".
 /// Rest machining of a pocket: after the main cutter, a smaller flat cutter visits only what the main one could not reach.
 #[allow(clippy::too_many_arguments)]
-fn rest_pass(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, o: &Operation, k: usize, mach: bool, main: &OpCtx, region: &[Path], tool: &Tool, id: &str) {
+fn rest_pass(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, o: &Operation, k: usize, main: &OpCtx, region: &[Path], tool: &Tool, id: &str) {
     let pre = format!("Op {}: ", k + 1);
     let (ku, un) = (e.ku, if e.imp { "in" } else { "mm" });
     let Some(rt) = data.tools.iter().find(|t| t.id == id) else { notes.push(tr_f("{pre}rest machining skipped: its tool is not in the tool list.", &[("pre", &pre)])); return };
@@ -1104,7 +1118,7 @@ fn rest_pass(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &Projec
         tabs_on: false, ztab: 0.0, tab_w: 5.0, tab_n: 4.0, lead: 0.0, slow: 0.0, troch: None };
     let mut jobs = mk_jobs(&rctx, &area, &[], &[], rt.dia / 2.0);
     if jobs.is_empty() { notes.push(tr_f("{pre}rest machining: what is left is too narrow for the {v} {un} tool.", &[("pre", &pre), ("v", &num(to_fixed(rt.dia / ku, 4))), ("un", &un)])); return; }
-    select_tool(e, ts, mach, rt, main.sz, &num(to_fixed(rt.dia / ku, 4)), un);
+    select_tool(e, ts, rt, main.sz, &num(to_fixed(rt.dia / ku, 4)), un);
     e.op_comment(format!("Operation {}: pocket, corners and narrow parts, tool {} {}", k + 1, num(to_fixed(rt.dia / ku, 4)), un));
     e.alt = true;
     run_jobs(e, &rctx, &mut jobs, &area, &zs, &[]);
@@ -1143,7 +1157,7 @@ fn no_toolpath_reason(data: &ProjectData, k: usize, kind: &str, tool: &Tool, reg
     Some(format!("{pre}{kname}: the {tname} is {} {un} wide, but the shape is only about {} {un} wide at its narrowest, so the tool does not fit inside. {advice}", fl(tool.dia), fl(width)))
 }
 
-fn select_pen(e: &mut Em, st: &mut ToolSt, mach: bool, tool: &Tool, sz: f64) {
+fn select_pen(e: &mut Em, st: &mut ToolSt, tool: &Tool, sz: f64) {
     if !st.ids.contains(&tool.id) { st.ids.push(tool.id.clone()); }
     let tno = st.ids.iter().position(|i| *i == tool.id).unwrap_or(0) + 1;
     let tname = tool_label(&tool.name);
@@ -1152,7 +1166,7 @@ fn select_pen(e: &mut Em, st: &mut ToolSt, mach: bool, tool: &Tool, sz: f64) {
         Some(t) if *t != tool.id => {
             e.rapid(None, None, Some(sz));
             if st.spun { e.spindle_off(); }
-            if !mach { e.stop(&format!("Change tool to the pen {}, then touch off Z0 on the paper and resume", tname)); }
+            if !e.atc { e.stop(&format!("Change tool to the pen {}, then touch off Z0 on the paper and resume", tname)); }
             e.tool_change(tool, tno);
         }
         _ => {}
@@ -1166,7 +1180,7 @@ fn air_lift(depth: f64) -> f64 { 10.0_f64.max(depth + 2.0) }
 
 /// A Draw operation: the pen follows the outline of every shape once, down at Z0 (a little below it for a spring-loaded holder),
 /// lifted a few millimetres between strokes. The strokes are ordered nearest first so the pen travels as little as it can.
-fn draw_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, o: &Operation, k: usize, mach: bool, mine: &[&LoopData]) -> Result<(), String> {
+fn draw_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, o: &Operation, k: usize, mine: &[&LoopData]) -> Result<(), String> {
     let pre = format!("Op {}: ", k + 1);
     let tool = data.tools.iter().find(|t| t.id == o.p.tool).ok_or_else(|| tr_f("Operation {n}: choose a pen (Manage… to create one)", &[("n", &(k + 1))]))?;
     if tool.shape != "pen" { return Err(tr_f("Operation {n}: Draw needs a pen or marker; choose one in Manage… (type: Pen / marker)", &[("n", &(k + 1))])); }
@@ -1203,7 +1217,7 @@ fn draw_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectD
         fill = Some((polys, gap));
     }
     if strokes.is_empty() { notes.push(tr_f("{pre}nothing to draw.", &[("pre", &pre)])); return Ok(()); }
-    select_pen(e, ts, mach, tool, sz);
+    select_pen(e, ts, tool, sz);
     e.op_comment(format!("Operation {}: draw with {}, pen down at {} {} below Z0, up at {} {} above it", k + 1, tool_label(&tool.name), num(to_fixed(o.p.depth.max(0.0) / e.ku, e.dec())), if e.imp { "in" } else { "mm" }, num(to_fixed(lift / e.ku, e.dec())), if e.imp { "in" } else { "mm" }));
     e.rapid(None, None, Some(sz));
     let join_under = o.p.join.filter(|v| *v > 0.0).unwrap_or(0.0);
@@ -1246,7 +1260,8 @@ fn draw_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectD
             if pen_down { e.rapid(None, None, Some(up)); }
             if d > 1e-9 || !pen_down { e.rapid(Some(a[0]), Some(a[1]), None); }
             e.feed(None, None, Some(down), tool.plunge);
-            if let Some(w) = dwell { e.ev.push(Event::Dwell { seconds: w, why: DwellWhy::Requested }); }
+            // to 0.01 s here (a value of the program, not a format), so that every post writes the same value
+            if let Some(w) = dwell { e.ev.push(Event::Dwell { seconds: to_fixed(w, 2), why: DwellWhy::Requested }); }
         }
         for q in &v[1..] { e.feed(Some(q[0]), Some(q[1]), Some(down), tool.feed); }
         pen_down = true;
@@ -1365,7 +1380,7 @@ fn op_pause(e: &mut Em, ts: &mut ToolSt, o: &Operation, k: usize, sz: f64) {
         e.rapid(None, None, Some(sz));
         if ts.spun { e.spindle_off(); }
         let msg = if msg.is_empty() { format!("Operation {} done: resume when ready", k + 1) } else { msg };
-        let msg = if e.marlin && ts.spun { format!("Stop the spindle. {msg}") } else { msg };
+        let msg = if e.manual_spindle && ts.spun { format!("Stop the spindle. {msg}") } else { msg };
         e.stop(&msg);
         ts.r = None;
         e.lf = None;
@@ -1399,7 +1414,7 @@ pub fn relief_depth(data: &ProjectData, p: &crate::model::OpParams) -> f64 {
     }
 }
 
-fn relief_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, machine: &Machine, o: &Operation, k: usize, mach: bool, sz_init: f64) -> Result<(), String> {
+fn relief_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, machine: &Machine, o: &Operation, k: usize, sz_init: f64) -> Result<(), String> {
     use crate::relief::{finish_lines, Cleared, Field, Footprint, Rough};
     let pre = format!("Op {}: ", k + 1);
     let un = if e.imp { "in" } else { "mm" };
@@ -1463,7 +1478,7 @@ fn relief_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &Projec
             let n = ((range / pdr) - 1e-9).ceil().max(1.0) as usize;
             let dz = range / n as f64;
             let rstep = ((rt.dia * o.p.r_so.filter(|v| *v > 0.0).unwrap_or(rt.so) / 100.0 / rp.gc).round() as usize).max(1);
-            select_tool(e, ts, mach, rt, sz, &fnum(rt.dia), un);
+            select_tool(e, ts, rt, sz, &fnum(rt.dia), un);
             e.alt = true;
             e.op_comment(format!("Operation {}: relief, roughing in {} layers, {} {} {}, leaving {} {}", k + 1, n, rg.shape.label(), fnum(rt.dia), un, fnum(leave), un));
             let mut first = true;
@@ -1551,7 +1566,7 @@ fn relief_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &Projec
             sets.push(ls);
         }
         nlines = sets.iter().map(|s| s.len()).sum();
-        select_tool(e, ts, mach, tool, sz, &fnum(tool.dia), un);
+        select_tool(e, ts, tool, sz, &fnum(tool.dia), un);
         e.op_comment(format!("Operation {}: relief, finishing, {} {} {}, lines {} {} apart", k + 1, fgeo.shape.label(), fnum(tool.dia), un, fnum(step as f64 * g), un));
         let mut count = 0usize;
         for (si, lines) in sets.iter().enumerate() {
@@ -1600,7 +1615,7 @@ fn relief_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &Projec
                 let dso = o.p.d_so.filter(|v| *v > 0.0).unwrap_or(dt.so);
                 let step = ((dt.dia * dso / 100.0 / g).round() as usize).max(1);
                 let rows = detail_lines(&f, &small, &need, step, 2 * rc, 0.01);
-                select_tool(e, ts, mach, dt, sz, &fnum(dt.dia), un);
+                select_tool(e, ts, dt, sz, &fnum(dt.dia), un);
                 e.det = true;
                 e.op_comment(format!("Operation {}: relief, detail, {} {} {}, lines {} {} apart", k + 1, dgeo.shape.label(), fnum(dt.dia), un, fnum(step as f64 * g), un));
                 let mut n = 0usize;
@@ -1660,7 +1675,7 @@ fn sanity(data: &ProjectData) -> Result<(), String> {
 }
 
 /// Photo V-carve: the picture etched with a V-bit along parallel lines, deeper where it is darker (see `photo.rs`).
-fn photo_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, machine: &Machine, o: &Operation, k: usize, mach: bool) -> Result<(), String> {
+fn photo_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &ProjectData, machine: &Machine, o: &Operation, k: usize) -> Result<(), String> {
     use crate::photo::{lines, Pass, Tones};
     let pre = format!("Op {}: ", k + 1);
     let un = if e.imp { "in" } else { "mm" };
@@ -1697,7 +1712,7 @@ fn photo_op(e: &mut Em, ts: &mut ToolSt, notes: &mut Vec<String>, data: &Project
     if dir == "x" || dir == "xy" { sets.push(lines(&tones, depth, spacing, true, 0.01, p1)); }
     if dir == "y" { sets.push(lines(&tones, depth, spacing, false, 0.01, p1)); }
     if dir == "xy" { sets.push(lines(&tones, depth, spacing, false, 0.01, p2)); }
-    select_tool(e, ts, mach, tool, sz, &fnum(tool.dia), un);
+    select_tool(e, ts, tool, sz, &fnum(tool.dia), un);
     e.op_comment(format!("Operation {}: photo V-carve, {} {} {}, lines {} {} apart, up to {} {} deep", k + 1, geo.shape.label(), fnum(tool.dia), un, fnum(spacing), un, fnum(depth), un));
     let mut count = 0usize;
     let mut first = true;
@@ -1756,7 +1771,11 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
     let sz_init = data.job.safe + if data.job.air { 10.0 } else { 0.0 };
     let (ox, oy) = zero_offsets(st);
     let zt = if st.zm == "top" { 0.0 } else { st.t - st.zh };
-    let mut e = Em { ev: vec![], cur: [ox, oy, sz_init], lf: None, time: 0.0, tc: 0.0, pn: 0, oi: 0, lap: false, pw: None, last_ring: None, link_ok: false, troch: vec![], moves: vec![], last_ev: 0, alt: false, det: false, marks: vec![], lead_skipped: 0, helix_skipped: 0, ox, oy, zt, ku, imp, rap: machine.rapid, tsc: machine.tsc, spin: if data.job.marlin() { 0.0 } else { machine.spin_up_s() }, rates: machine.rates(), capped: 0, marlin: data.job.marlin(), mach: data.job.mach() };
+    // what the controller can do decides what is emitted; the post writes the text at the end
+    let post = crate::post::for_job(&data.job);
+    let caps = post.caps();
+    let manual_spindle = caps.spindle == SpindleCtl::Manual;
+    let mut e = Em { ev: vec![], cur: [ox, oy, sz_init], lf: None, time: 0.0, tc: 0.0, pn: 0, oi: 0, lap: false, pw: None, last_ring: None, link_ok: false, troch: vec![], moves: vec![], last_ev: 0, alt: false, det: false, marks: vec![], lead_skipped: 0, helix_skipped: 0, ox, oy, zt, ku, imp, rap: machine.rapid, tsc: machine.tsc, spin: if manual_spindle || caps.dwell == DwellUnit::None { 0.0 } else { machine.spin_up_s() }, rates: machine.rates(), capped: 0, manual_spindle, atc: caps.tool_change_halts() };
     let mut notes: Vec<String> = limit_notes;
 
     if data.loops.iter().filter(|l| !data.ops.iter().any(|o| o.id == l.op && o.p.surf)).any(|l| l.pts.chunks_exact(2).any(|p| (p[0] as f64) < 0.0 || (p[1] as f64) < 0.0 || (p[0] as f64) > st.w * S || (p[1] as f64) > st.h * S)) {
@@ -1766,11 +1785,10 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
     if st.w > machine.x + 1e-6 || st.h > machine.y + 1e-6 || st.t > machine.z + 1e-6 {
         notes.push(tr_f("⚠ The stock is larger than the machine work area ({v} × {v2} × {v3} {un}).", &[("v", &num(fl(machine.x))), ("v2", &num(fl(machine.y))), ("v3", &num(fl(machine.z))), ("un", &un)]));
     }
-    let mach = data.job.mach();
-    e.comment(CommentKind::Info, format!("PutiaCNC - {}", data.job.dialect_name()));
+    e.comment(CommentKind::Info, format!("PutiaCNC - {}", post.name()));
     e.comment(CommentKind::Info, format!("Stock {} x {} x {} {}; XY0 = {} of stock, Z0 = {}", num(fl(st.w)), num(fl(st.h)), num(fl(st.t)), un, zero_label(&st.zr),
         if st.zm == "top" { "top surface".to_string() } else { format!("stock bottom + {} {}", num(fl(st.zh)), un) }));
-    // units, absolute, plane, feed mode and the work coordinate system (G54 unless the job says another), as the dialect writes them
+    // units, absolute, plane, feed mode and the work coordinate system (G54 unless the job says another), as the post writes them
     e.ev.push(Event::Setup);
 
     let custom = |s: &Option<String>| -> Vec<String> { s.as_deref().unwrap_or("").lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect() };
@@ -1785,15 +1803,17 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
     let mut any = false;
 
     for (k, o) in data.ops.iter().enumerate() {
+        e.end_op();
+        e.ev.push(Event::OperationStart { index: k, name: o.p.kind.clone() });
         e.oi = k;
         let pre = format!("Op {}: ", k + 1);
         if o.p.kind == "relief" {
-            relief_op(&mut e, &mut ts, &mut notes, data, &machine, o, k, mach, sz_init)?;
+            relief_op(&mut e, &mut ts, &mut notes, data, &machine, o, k, sz_init)?;
             any = true;
             continue;
         }
         if o.p.kind == "photo" {
-            photo_op(&mut e, &mut ts, &mut notes, data, &machine, o, k, mach)?;
+            photo_op(&mut e, &mut ts, &mut notes, data, &machine, o, k)?;
             op_pause(&mut e, &mut ts, o, k, data.job.safe + if o.p.air || data.job.air { air_lift(o.p.depth) } else { 0.0 });
             any = true;
             continue;
@@ -1806,7 +1826,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
         }
         if mine.is_empty() { notes.push(no_shapes_note(k)); continue; }
         if o.p.kind == "draw" {
-            draw_op(&mut e, &mut ts, &mut notes, data, o, k, mach, &mine)?;
+            draw_op(&mut e, &mut ts, &mut notes, data, o, k, &mine)?;
             op_pause(&mut e, &mut ts, o, k, data.job.safe + if o.p.air || data.job.air { air_lift(o.p.depth) } else { 0.0 });
             any = true;
             continue;
@@ -1935,19 +1955,19 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
                 if jobs.is_empty() {
                     notes.push(tr_f("{pre}the floor is too narrow for the flat end mill; the V-bit cuts all of it.", &[("pre", &pre)]));
                 } else {
-                    select_tool(&mut e, &mut ts, mach, ft, sz, &fdia, un);
+                    select_tool(&mut e, &mut ts, ft, sz, &fdia, un);
                     e.alt = true;
                     e.op_comment(format!("Operation {}: {}, clear the floor, {}", k + 1, label, ftxt));
                     for &z in &zsf { for j in jobs.iter_mut() { cut(&mut e, &c, j, &[z], &[]); } }
                     e.alt = false;
                 }
                 // 2. V-bit cuts the sloped walls
-                select_tool(&mut e, &mut ts, mach, tool, sz, &num(fl(dia)), un);
+                select_tool(&mut e, &mut ts, tool, sz, &num(fl(dia)), un);
                 e.op_comment(format!("Operation {}: {}, sloped walls, {}", k + 1, label, vtxt));
                 emit_rings(&mut e, &rings, ring_rev, z0, sz, hop, plunge, feed);
             } else {
                 // 1. V-bit carves the sloped sides of the plug
-                select_tool(&mut e, &mut ts, mach, tool, sz, &num(fl(dia)), un);
+                select_tool(&mut e, &mut ts, tool, sz, &num(fl(dia)), un);
                 e.op_comment(format!("Operation {}: {}, sloped sides, {}", k + 1, label, vtxt));
                 emit_rings(&mut e, &rings, ring_rev, z0, sz, hop, plunge, feed);
                 // 2. flat end mill cuts the plug out, through the stock
@@ -1957,7 +1977,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
                 let mut jobs = mk_jobs(&c, &base, &[], &[], rf);
                 if jobs.is_empty() { notes.push(tr_f("{pre}nothing to cut out.", &[("pre", &pre)])); }
                 else {
-                    select_tool(&mut e, &mut ts, mach, ft, sz, &fdia, un);
+                    select_tool(&mut e, &mut ts, ft, sz, &fdia, un);
                     e.alt = true;
                     e.op_comment(format!("Operation {}: {}, cut out through the stock, {}", k + 1, label, ftxt));
                     let guard: Vec<Path> = jobs.iter().filter(|j| !j.pocket || j.gen == 0).map(|j| j.p.clone()).collect();
@@ -2117,7 +2137,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
             if kind == "pocket" && !by_pass {
                 if let Some(id) = o.p.rest.as_deref() {
                     let before = e.moves.len();
-                    rest_pass(&mut e, &mut ts, &mut notes, data, o, k, mach, &ctx, &region, tool, id);
+                    rest_pass(&mut e, &mut ts, &mut notes, data, o, k, &ctx, &region, tool, id);
                     if e.moves.len() > before {
                         let rn = data.tools.iter().find(|t| t.id == id).map(|t| tool_label(&t.name)).unwrap_or_default();
                         notes.push(tr_f("{pre}the {tool} is wider than the shape (about {w} {un}), so the whole pocket is cut with the Corners tool, the {corners}.",
@@ -2140,7 +2160,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
             }
         }
 
-        select_tool(&mut e, &mut ts, mach, tool, sz, &num(fl(dia)), un);
+        select_tool(&mut e, &mut ts, tool, sz, &num(fl(dia)), un);
         e.op_comment(format!("Operation {}: {}, tool {} {}{}", k + 1, kind, num(fl(dia)), un,
             if geo.cone { format!(", {} deg", num(if tool.angle != 0.0 { tool.angle } else { 60.0 })) } else { String::new() }));
 
@@ -2179,7 +2199,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
             if let Some((rt, area, rctx, mut fj, zs)) = flat_clear.take() {
                 let (ku, un2) = (e.ku, if e.imp { "in" } else { "mm" });
                 let dia_txt = num(to_fixed(rt.dia / ku, 4));
-                select_tool(&mut e, &mut ts, mach, &rt, sz, &dia_txt, un2);
+                select_tool(&mut e, &mut ts, &rt, sz, &dia_txt, un2);
                 e.op_comment(format!("Operation {}: V-carve, flat floor, tool {} {}", k + 1, dia_txt, un2));
                 e.alt = true;
                 run_jobs(&mut e, &rctx, &mut fj, &area, &zs, &[]);
@@ -2195,7 +2215,7 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
             run_jobs(&mut e, &ctx, &mut jobs, &region, &zs, &[]);
             finish_pass(&mut e, &ctx, &mut fin, &region, &zs, tool, depth, k);
             if let Some(id) = o.p.rest.as_deref() {
-                rest_pass(&mut e, &mut ts, &mut notes, data, o, k, mach, &ctx, &region, tool, id);
+                rest_pass(&mut e, &mut ts, &mut notes, data, o, k, &ctx, &region, tool, id);
             }
         } else {
             let guard: Vec<Path> = jobs.iter().filter(|j| !j.pocket || j.gen == 0).map(|j| j.p.clone()).collect();
@@ -2214,24 +2234,27 @@ pub fn generate(data: &ProjectData, units: Units) -> Result<Output, String> {
         op_pause(&mut e, &mut ts, o, k, sz);
         any = true;
     }
+    e.end_op();
     if !any {
         // say why, operation by operation, when we know; the general advice only when nothing more specific is known
         let why: Vec<&String> = notes.iter().filter(|n| n.starts_with("Op ")).collect();
         return Err(if why.is_empty() { tr_f("No toolpath: attach closed shapes to an operation (or the tool is too large). {notes}", &[("notes", &notes.join(" "))]) }
             else { tr_f("No toolpath. {why}", &[("why", &why.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))]) });
     }
-    if ts.spun && e.marlin { e.stop("Stop the spindle, then resume"); } else if ts.spun { e.ev.push(Event::SpindleOff); }
+    if ts.spun && e.manual_spindle { e.stop("Stop the spindle, then resume"); } else if ts.spun { e.ev.push(Event::SpindleOff); }
     e.ev.push(Event::ProgramEnd { park: Some(Xyz::new(Some(0.0), Some(0.0), None)) });
     let cut_len: f64 = e.moves.iter().filter(|m| m.cut).map(|m| ((m.to[0] - m.from[0]).powi(2) + (m.to[1] - m.from[1]).powi(2) + (m.to[2] - m.from[2]).powi(2)).sqrt()).sum();
     let program = Program {
-        meta: Meta { dialect: Dialect::from_post(&data.job.post), units, wcs: data.job.wcs_name(), numbered: data.job.numbered, arcs: machine.arcs == Some(true),
+        meta: Meta { units, wcs: caps.wcs_name(data.job.wcs), numbered: data.job.numbered, arcs: machine.arcs == Some(true),
                      start_code, end_code, start_at, troch: std::mem::take(&mut e.troch) },
         events: std::mem::take(&mut e.ev),
     };
-    // the text: arcs (the trochoidal loops always), the machine's own start and end lines, Marlin's comments, line numbers
-    let r = crate::program::render_canonical::render(&program);
+    // the text: arcs (the trochoidal loops always), the events, the machine's own start and end lines, line numbers
+    let props = std::collections::BTreeMap::new();
+    let r = post.render(&program, &PostCtx { machine: &machine, props: &props, safe_z: data.job.safe }).map_err(|e| e.to_string())?;
     if r.troch_arcs > 0 { notes.push(tr_f("Trochoidal loops written as {n} G2/G3 arcs: run an air cut first if this machine has not done arcs before.", &[("n", &r.troch_arcs)])); }
     if r.arcs > 0 { notes.push(tr_n(r.arcs as u64, "{n} arc written as G2/G3: shorter file; run an air cut first if this machine has not done arcs before.", "{n} arcs written as G2/G3: shorter file; run an air cut first if this machine has not done arcs before.")); }
+    notes.extend(r.notes.iter().cloned());
     let (start_code, end_code) = (&program.meta.start_code, &program.meta.end_code);
     if !start_code.is_empty() || !end_code.is_empty() {
         notes.push(tr_f("{machine}: {start} and {end} of your own G-code added; the time estimate does not include any moves in them.", &[("machine", &machine.name),

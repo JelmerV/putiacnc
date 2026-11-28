@@ -1,20 +1,18 @@
 //! The intermediate representation (IR) between the toolpath generator and the G-code text (phase 1 of
 //! `docs/post-processor-spec.md`).
 //!
-//! `toolpath::generate` walks the operations and pushes [`Event`]s, in program order, into a [`Program`]; the canonical renderer
-//! ([`render_canonical`]) turns the program into the text lines of today's built-in dialects (GRBL, grblHAL, FluidNC,
-//! Mach3 / LinuxCNC, Marlin). Every line of the output comes from one event (or from the machine's own start and end code), so
-//! the renderer also returns which event each line came from.
+//! `toolpath::generate` asks the job's post (`crate::post`) what the controller can do, walks the operations and pushes
+//! [`Event`]s, in program order, into a [`Program`]; the post turns the program into text (phase 2: the post engine with the
+//! built-in packages). Every line of the output comes from one event (or from the machine's own start and end code), so the post
+//! also returns which event each line came from.
 //!
 //! Values are millimetres, mm/min and seconds, in absolute work coordinates: what the emitter writes as `x - ox`, `y - oy` and
-//! `z + zt`. The renderer converts to the output units and rounds. Comment and message texts are final text (they can hold
+//! `z + zt`. The post converts to the output units and rounds. Comment and message texts are final text (they can hold
 //! values already written in inches).
 //!
 //! The move list and the time estimate are not rebuilt from the events: the generator keeps computing them where it decides a
 //! move, as before (two events have no move: the first lift to safe Z and the park at the end).
 use crate::model::Units;
-
-pub mod render_canonical;
 
 /// A program: what the generator decided, before it is written as text.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -23,14 +21,13 @@ pub struct Program {
     pub events: Vec<Event>,
 }
 
-/// What the renderer needs besides the events. In phase 1 that is the dialect and the job settings that today's text depends on;
-/// later phases move most of it into the post's properties (see the implementation log).
+/// What the post needs besides the events: the job settings that today's text depends on. Phase 4a moves `numbered`, `arcs`,
+/// `start_code` and `end_code` into the post's properties (see the implementation log).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Meta {
-    pub dialect: Dialect,
     /// The output units (the events are always in mm).
     pub units: Units,
-    /// The work coordinate system word, already resolved for the dialect (`Job::wcs_name`).
+    /// The work coordinate system word, already resolved with the post's `caps.wcs_count` (`Caps::wcs_name`).
     pub wcs: &'static str,
     /// Number the lines (N10, N20, ...).
     pub numbered: bool,
@@ -48,21 +45,8 @@ pub struct Meta {
 
 impl Default for Meta {
     fn default() -> Self {
-        Meta { dialect: Dialect::Grbl, units: Units::Metric, wcs: "G54", numbered: false, arcs: false, start_code: vec![], end_code: vec![], start_at: 0, troch: vec![] }
+        Meta { units: Units::Metric, wcs: "G54", numbered: false, arcs: false, start_code: vec![], end_code: vec![], start_at: 0, troch: vec![] }
     }
-}
-
-/// The built-in dialects (`Job::post`). grblHAL and FluidNC write what GRBL gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dialect { Grbl, GrblHal, FluidNc, Mach, Marlin }
-
-impl Dialect {
-    /// The dialect of a `Job::post` / `Machine.post` value; anything unknown is GRBL, as `Job::mach` and `Job::marlin` read it.
-    pub fn from_post(post: &str) -> Dialect {
-        match post { "grblhal" => Dialect::GrblHal, "fluidnc" => Dialect::FluidNc, "mach" => Dialect::Mach, "marlin" => Dialect::Marlin, _ => Dialect::Grbl }
-    }
-    pub fn mach(self) -> bool { self == Dialect::Mach }
-    pub fn marlin(self) -> bool { self == Dialect::Marlin }
 }
 
 /// One step of the program. Kept small (48 bytes): a big relief has hundreds of thousands of moves, and the GUI clones the output.
@@ -70,10 +54,15 @@ impl Dialect {
 pub enum Event {
     /// A comment line; `text` without the brackets.
     Comment { text: String, kind: CommentKind },
-    /// The setup block after the header comments: units, absolute coordinates, plane, feed mode, work offset (the spec's `on_open`).
+    /// The setup block after the header comments: units, absolute coordinates, plane, feed mode, work offset (the post's `on_open`).
     Setup,
+    /// An operation starts (`index` in the project's list, `name` what it is, e.g. "pocket"); the post's `on_section`. What the
+    /// operation does is written by the `Comment { kind: Operation }` events that follow, so the built-in posts write nothing here.
+    OperationStart { index: usize, name: String },
+    /// The operation `index` ends (after its operator pause, if it has one); the post's `on_section_end`.
+    OperationEnd { index: usize },
     /// This tool is in the spindle from here on (the first tool, or a change). Whether the operator is asked to change it is a `Stop`
-    /// the generator puts before it.
+    /// the generator puts before it (`caps.tool_change`).
     ToolChange { tool: Box<ToolRef> },
     /// The spindle starts, clockwise.
     SpindleOn { rpm: f64 },
@@ -81,9 +70,14 @@ pub enum Event {
     Dwell { seconds: f64, why: DwellWhy },
     /// A rapid move. `to` holds the axes the emitter decided to write.
     Rapid { to: Xyz },
-    /// A cutting move at `feed` mm/min. `write_feed`: the feed word is written (the emitter's modal feed rule, which forgets the feed
-    /// at a tool change and a pause). A feed move can change no axis and only set the feed.
+    /// A cutting move at `feed` mm/min. `write_feed`: the feed is given, like an axis in `to` (the emitter's modal feed rule: the
+    /// value changed, or a tool or pen selection or an operator pause made it forget the feed, even where they wrote nothing). A
+    /// post whose F word is `as_given` writes F exactly then; a `modal` F decides for itself. A feed move can change no axis and only
+    /// set the feed.
     Feed { to: Xyz, feed: f64, write_feed: bool },
+    /// A circular cutting move (`on_circular`). The generator writes none yet: the post fits arcs over runs of short `Feed` moves
+    /// itself (the same fitting as before the IR). Boxed, so that a move event stays small.
+    Arc(Box<ArcTo>),
     /// The program stops until the operator resumes it.
     Stop { message: String, optional: bool },
     /// The end: the park move (work coordinates) and the end of the program.
@@ -92,8 +86,8 @@ pub enum Event {
 
 impl Event {
     /// True when the machine stands still at this event (the spindle starts or stops, a dwell, a stop for the operator, or a tool
-    /// change the controller makes itself): the next move starts from rest. `tool_change_halts`: the dialect writes the tool
-    /// change as a command (Mach3 / LinuxCNC `T# M6`); elsewhere it is a comment, and the stop before it is what halts.
+    /// change the controller makes itself): the next move starts from rest. `tool_change_halts`: the controller changes the tool
+    /// itself (`caps.tool_change = atc`, a `T# M6` command); with a manual change the stop before it is what halts.
     pub fn halts(&self, tool_change_halts: bool) -> bool {
         match self {
             Event::SpindleOn { .. } | Event::SpindleOff | Event::Dwell { .. } | Event::Stop { .. } => true,
@@ -101,6 +95,24 @@ impl Event {
             _ => false,
         }
     }
+
+    /// An operation marker (`OperationStart`, `OperationEnd`): no move, no machine action. The trochoidal ranges count back over the
+    /// events around them without these, so that a range covers the same lines as before the markers existed.
+    pub fn is_marker(&self) -> bool { matches!(self, Event::OperationStart { .. } | Event::OperationEnd { .. }) }
+}
+
+/// The end, centre and direction of an [`Event::Arc`], in work mm; the start is where the previous move ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArcTo {
+    /// The end point (the axes given, like a `Feed`; Z given makes it a helix).
+    pub to: Xyz,
+    /// The centre, X and Y.
+    pub center: [f64; 2],
+    /// Clockwise (G2) or counter-clockwise (G3).
+    pub cw: bool,
+    pub feed: f64,
+    /// The feed is given (as `Feed::write_feed`).
+    pub write_feed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +138,9 @@ pub enum DwellWhy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolRef {
     pub id: String,
-    /// The tool's name as the user typed it (the renderer makes it plain ASCII for a comment).
+    /// The tool's name as the user typed it (a post makes it plain ASCII for a comment with the `comment` filter).
     pub name: String,
-    /// Mach3 / LinuxCNC tool number: the order of first use in the program.
+    /// The tool number a post writes (`T#`): the order of first use in the program (phase 3: the machine's tool table).
     pub number: u32,
     pub length_offset: Option<u32>,
     pub dia: f64,
@@ -202,21 +214,25 @@ mod tests {
             assert!(e.halts(false) && e.halts(true), "{e:?}");
         }
         assert!(tool.halts(true) && !tool.halts(false));
+        let arc = Event::Arc(Box::new(ArcTo { to: Xyz::new(Some(1.0), Some(0.0), None), center: [0.0, 0.0], cw: false, feed: 500.0, write_feed: true }));
         for e in [Event::Setup, Event::Comment { text: "Pass 1".into(), kind: CommentKind::Pass }, Event::Rapid { to: Xyz::new(None, None, Some(5.0)) },
-                  Event::Feed { to: Xyz::NONE, feed: 800.0, write_feed: true }, Event::ProgramEnd { park: None }] {
+                  Event::Feed { to: Xyz::NONE, feed: 800.0, write_feed: true }, Event::ProgramEnd { park: None }, arc,
+                  Event::OperationStart { index: 0, name: "pocket".into() }, Event::OperationEnd { index: 0 }] {
             assert!(!e.halts(true), "{e:?}");
         }
     }
 
     #[test]
-    fn dialects_are_read_like_the_job_reads_them() {
-        assert_eq!(Dialect::from_post(""), Dialect::Grbl);
-        assert_eq!(Dialect::from_post("something-else"), Dialect::Grbl);
-        for (post, _) in crate::model::DIALECTS {
-            let d = Dialect::from_post(post);
-            let job = crate::model::Job { post: post.into(), ..Default::default() };
-            assert_eq!((d.mach(), d.marlin()), (job.mach(), job.marlin()), "{post}");
+    fn only_the_operation_markers_are_markers() {
+        assert!(Event::OperationStart { index: 2, name: "drill".into() }.is_marker() && Event::OperationEnd { index: 2 }.is_marker());
+        for e in [Event::Setup, Event::SpindleOff, Event::Comment { text: "Operation 3: drill".into(), kind: CommentKind::Operation }, Event::Rapid { to: Xyz::NONE }] {
+            assert!(!e.is_marker(), "{e:?}");
         }
-        assert_eq!(Program::default().meta.wcs, "G54");
+    }
+
+    #[test]
+    fn the_default_meta_is_metric_g54() {
+        let m = Program::default().meta;
+        assert_eq!((m.units, m.wcs, m.numbered, m.arcs), (Units::Metric, "G54", false, false));
     }
 }

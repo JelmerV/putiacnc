@@ -1,0 +1,63 @@
+# Marlin on a machine whose board does not run the spindle: the program stops and asks the operator to start and stop it.
+# Byte for byte what PutiaCNC wrote before posts were packages (tests/golden).
+
+[post]
+format_version = 1
+name = "Marlin (no spindle control)"
+extension = "nc"
+line_ending = "lf"
+
+[caps]
+arcs = "xy"
+max_arc_sweep = 180
+tool_change = "manual"
+length_offset = false
+spindle = "manual"        # no M3 / M5: stops that ask the operator, and no wait for the spindle
+dwell = "seconds"         # kept as PutiaCNC wrote it (G4 P<seconds>); Marlin reads P as milliseconds, see the implementation log
+comments = "semicolon"    # (text) is written as ; text, also in the machine's own start and end code
+wcs_count = 1             # no coordinate systems to pick: the operator sets the zero with G92
+
+[format]
+xyz = { decimals = 3, inch_decimals = 4, length = true }
+feed = { decimals = 1, inch_decimals = 2, length = true }
+rpm = {}
+seconds = {}
+
+[words]
+X = { format = "xyz", mode = "as_given" }
+Y = { format = "xyz", mode = "as_given" }
+Z = { format = "xyz", mode = "as_given" }
+I = { format = "xyz", incremental = true }
+J = { format = "xyz", incremental = true }
+F = { format = "feed", mode = "as_given" }
+S = { format = "rpm" }
+P = { format = "seconds" }
+
+[modal]
+motion = { codes = ["G0", "G1", "G2", "G3"], always = ["G0", "G1", "G2", "G3"] }
+
+[templates]
+# what Marlin knows: units and absolute moves. It has no work coordinate systems to pick, so the zero is where the operator sets it.
+on_open = """
+{units} G90
+(Marlin: jog the tool to the zero of the job and set it there with G92 X0 Y0 Z0 before you run this file)
+(Spindle: by hand. The program stops to ask you to start and stop it)
+"""
+on_section = ""
+on_section_end = ""
+on_section_tool = "(Tool: {tool.name|comment})"
+on_rapid = "{G} {X} {Y} {Z}"
+on_linear = "{G} {X} {Y} {Z} {F}"
+on_circular = "{G} {X} {Y} {I} {J} {F}"
+on_dwell = "G4 {P}"
+# Marlin shows everything after M0: plain text, with no letter touching a number (a reader would take "Z0" for a move)
+on_command = """
+?stop: M0 {message|plain}
+?optional_stop: M1 {message|plain}
+"""
+on_comment = "({text})"
+# Marlin has no end-of-program word (M30 would delete a file on its SD card)
+on_close = """
+G0 {X:park} {Y:park}
+(End of program)
+"""
