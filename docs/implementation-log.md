@@ -53,6 +53,7 @@ files, and it alone would add 2 MB. The pocket rest pass, which no golden reache
 
 Two Marlin quirks are now frozen as they are (not changed by phase 1): the pen dwell is written as `G4 P..` on Marlin, and a
 `-plug` file's header keeps "Stock" on Marlin (`pieces.rs` looks for `(Stock ` after the renderer turned it into `; Stock`).
+The first was fixed after phase 2 (Marlin's `G4 P` is milliseconds): see "After phase 2: Marlin's dwell in milliseconds".
 
 ### What moved where
 
@@ -291,7 +292,7 @@ in the binary; the canonical renderer of phase 1 is gone. Arcs are fitted on the
 
 | # | Before (phase 1) | Now |
 |---|---|---|
-| 1 | no spin-up wait on Marlin | `Em.spin` is 0 when `spindle = manual` or `dwell = none`; the pen's requested `G4` is not tied to either (Marlin keeps it, as the goldens freeze) |
+| 1 | no spin-up wait on Marlin | `Em.spin` is 0 when `spindle = manual` or `dwell = none`; the pen's requested `G4` is not tied to either (Marlin keeps it, as the goldens freeze; in milliseconds since the change after phase 2) |
 | 2 | Marlin: `Stop("Start the spindle at N rpm, then resume")` | the same when `spindle = manual` |
 | 3 | Marlin: no `SpindleOff` | `spindle = manual` |
 | 4 | a stop before a tool change except on Mach3; Marlin's message "Stop the spindle and change tool…" | a stop when `tool_change = manual`, that message when also `spindle = manual`; the pen's stop keeps its message ("Change tool to the pen …") as before |
@@ -438,9 +439,9 @@ is unchanged. The built-in packages are parsed once, at first use.
 
 ### Open problems
 
-- **Marlin's dwell unit.** Marlin reads `G4 P` as milliseconds; the built-in writes the pen's dwell in seconds (`G4 P0.13`), as
-  PutiaCNC always did and the goldens freeze, so on Marlin the pen waits 0.13 ms. The fix (`dwell = "milliseconds"` in the Marlin
-  package, or `G4 S`) is a reviewed golden change for after phase 2.
+- **Marlin's dwell unit.** Marlin reads `G4 P` as milliseconds; the built-in wrote the pen's dwell in seconds (`G4 P0.13`), as
+  PutiaCNC always did and the goldens froze, so on Marlin the pen waited 0.13 ms. Fixed after phase 2 as a reviewed golden change:
+  see "After phase 2: Marlin's dwell in milliseconds" below.
 - **The fitter reads X/Y words in text.** To stay identical, the engine reads non-move lines with `arcs::xy`, as the text fitter
   did: a GRBL stop "M0 ; move X10 away" or a Mach3 line "T1 M6 (Tool 1: X5 bit)" sets the fitter's idea of X, and a run of cuts
   that follows before a move gives X again is fitted from that wrong start (its arc carries the fitter's end point, not the
@@ -499,3 +500,29 @@ is unchanged. The built-in packages are parsed once, at first use.
   including `P{P}`. `src/post/text.rs`: number formats (trimmed, padded, inch, raw, ties, `-0`), both filters, comment styles.
 - `src/program.rs`: the new events do not halt; only the markers are markers.
 - `tests/arc_fitter.rs`: the IR fitter against the text fitter on the golden programs (above).
+
+## After phase 2: Marlin's dwell in milliseconds
+
+A change of its own, after phase 2 and outside the phases (which must not change output). The Marlin built-in wrote a requested
+dwell (a Draw operation's pen-down rest, `OpParams::dwell`) as `G4 P<seconds>`, e.g. `G4 P0.13` for 0.13 s. Marlin's `G4`
+reads `P` as **milliseconds** (`S` as seconds), so the machine waited 0.13 ms instead of 0.13 s. GRBL, grblHAL, FluidNC and
+Mach3 / LinuxCNC read `P` as seconds, so their output stays as it was. Phases 0 to 2 froze it on purpose; it is fixed here.
+
+- **The package** (`src/post/builtin/marlin/post.toml`): `[caps] dwell = "milliseconds"` (the engine passes seconds × 1000
+  to `{P}`) and `P = { format = "milliseconds" }` with `milliseconds = { decimals = 0 }`. Whole milliseconds, because Marlin
+  reads `P` as a whole number and seconds × 1000 is not always one in floating point (2.01 s gives 2009.9999999999998, which
+  the `seconds = {}` format would print in full). The format is not a length, so inch output writes the same number.
+  `on_dwell` stays `G4 {P}`. `G4 S{P}` (seconds) was not possible: a word writes its own letter, so that would be `G4 SP0.13`.
+  Marlin's spin-up wait is never emitted (`spindle = manual`), so the pen's requested dwell is the only `G4` the post writes.
+- **The 3D preview** (`src/replay.rs`): it read every `G4 P` as seconds, so `G4 P130` would have played as a 130 s wait per
+  pen-down. It now reads `P` the way the controller does: milliseconds when the job's dialect is Marlin (`Job::marlin()`),
+  seconds otherwise. This is a fact about the controller, from the model; `replay` still shares no code with `toolpath` or the
+  posts. `summary` reads a `G4` only right after `M3`, which Marlin never writes, and `verify` does not read `G4`.
+- **Goldens.** `UPDATE_GOLDEN=1 cargo test --test golden` changed two files, three lines each, all `G4 P0.13` → `G4 P130`:
+  `pen/marlin-metric-noarcs.nc` and `pen/marlin-imperial-noarcs.nc`. `pen-tool-change/marlin-*` have no `G4` (no spin-up wait
+  on Marlin, and that case sets no pen dwell); the `G4 P1` in `opt-start-end-code*/marlin-*` is the machine's own start code,
+  written as given. No `.notes.txt` and no snapshot in `tests/data` changed.
+- **Tests.** `post::tests::marlin_dwells_in_whole_milliseconds` (0.13, 2.01, 0.125 and 30 s, mm and inch, against the other
+  built-ins' seconds); `marlin_metric` and `the_builtins_capabilities` updated; `tests/replay.rs`
+  `a_pens_rest_is_read_in_the_unit_of_the_controller` (a pen rest of 0.25 s on GRBL, Mach3 and Marlin: the text, and a 0.25 s
+  wait in the replay on all three; it fails with 250 s on Marlin without the replay change).

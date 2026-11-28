@@ -15,7 +15,7 @@ use crate::toolpath::{stop_message, tool_label, zero_offsets, Move};
 pub enum Kind {
     /// A rapid or a cut.
     Move,
-    /// `G4`: seconds.
+    /// `G4`: seconds (read from `P`: seconds, or milliseconds on Marlin).
     Wait(f64),
     /// `M0`: the program stops until the operator resumes it; the message from the line's comment.
     Stop(String),
@@ -103,6 +103,8 @@ pub fn replay(lines: &[String], data: &ProjectData) -> Replay {
     let st = &data.stock;
     let (ox, oy) = zero_offsets(st);
     let zt = if st.zm == "top" { 0.0 } else { st.t - st.zh };
+    // seconds per unit of G4's P, as the controller reads it: Marlin in milliseconds; GRBL, grblHAL, FluidNC, Mach3 / LinuxCNC in seconds
+    let p_secs = if data.job.marlin() { 0.001 } else { 1.0 };
     // per operation: the labels of its tool and its second tool
     let labels: Vec<(String, Option<String>, Option<String>)> = data.ops.iter().map(|o| {
         let name = |id: &str| data.tools.iter().find(|t| t.id == id).map(|t| tool_label(&t.name)).unwrap_or_default();
@@ -154,7 +156,7 @@ pub fn replay(lines: &[String], data: &ProjectData) -> Replay {
         if let Some(v) = f { feed = v * ku; }
         for m in m_codes {
             match m {
-                4 => { let secs = p_.unwrap_or(0.0).max(0.0); r.moves.push(zero(pos, op, pass, secs / 60.0)); r.info.push(Info { line: li, kind: Kind::Wait(secs) }); }
+                4 => { let secs = p_.unwrap_or(0.0).max(0.0) * p_secs; r.moves.push(zero(pos, op, pass, secs / 60.0)); r.info.push(Info { line: li, kind: Kind::Wait(secs) }); }
                 1003 | 1004 => { r.moves.push(zero(pos, op, pass, 0.0)); r.info.push(Info { line: li, kind: Kind::Spindle(true) }); }
                 1005 => { r.moves.push(zero(pos, op, pass, 0.0)); r.info.push(Info { line: li, kind: Kind::Spindle(false) }); }
                 1000 | 1001 => {

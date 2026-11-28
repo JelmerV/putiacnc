@@ -62,6 +62,23 @@ fn stops_waits_and_tools_are_steps_with_their_line() {
     for (n, i) in r.info.iter().enumerate() { assert!(r.step_of_line(i.line) <= n); }
 }
 
+/// A pen's rest after it goes down is `G4 P` in the controller's unit: seconds on GRBL, milliseconds on Marlin (`G4 P250`). The
+/// replay reads it the way the machine does, so the 3D preview waits 0.25 s on both, not 250 s on Marlin.
+#[test]
+fn a_pens_rest_is_read_in_the_unit_of_the_controller() {
+    let mut d = sample("hardware_pen_test");
+    d.ops[1].p.dwell = Some(0.25);
+    for (post, word) in [("", "G4 P0.25"), ("mach", "G4 P0.25"), ("marlin", "G4 P250")] {
+        let mut d = d.clone(); d.job.post = post.into();
+        let o = generate(&d, Units::Metric).unwrap();
+        let rests = o.lines.iter().filter(|l| l.starts_with("G4 ")).count(); // "G4 ": Mach3's G40 G49 G80 is no rest
+        assert!(rests > 1 && o.lines.iter().filter(|l| l.as_str() == word).count() == rests, "{post:?}: every rest is {word}");
+        let waits: Vec<f64> = replay(&o.lines, &d).info.iter().filter_map(|i| match i.kind { Kind::Wait(s) => Some(s), _ => None }).collect();
+        assert_eq!(waits.len(), rests, "{post:?}");
+        assert!(waits.iter().all(|s| (s - 0.25).abs() < 1e-9), "{post:?}: {waits:?}");
+    }
+}
+
 #[test]
 fn lines_that_cannot_be_placed_are_listed_not_guessed() {
     let d = sample("outside_holes");

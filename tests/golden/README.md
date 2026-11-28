@@ -56,7 +56,7 @@ than one tool.
 | `opt-wcs-g56-spin0/` | small two-tool job | `job.wcs` = 2 (G56) and a spin-up of 0 s (no `G4` after `M3`) |
 | `opt-wcs-g59-1/` | small two-tool job | `job.wcs` = 6: G59.1 on Mach3 / LinuxCNC, G54 on the dialects that do not have it |
 | `pause/` | `tests/data/hardware_m0_aircut.project.json` | an operation pause with the spindle running (`M5`, `M0` with the message), a pause that ends a per-tool file |
-| `pen/` | `tests/data/hardware_pen_test.project.json`, with a pen-down dwell of 0.125 s on operation 2 | pen drawing (`select_pen`, `draw_op`, `G4 P0.13` with 2 decimals), a pause with no spindle running; metric **and imperial** (the draw comment gives the pen heights in the output units) |
+| `pen/` | `tests/data/hardware_pen_test.project.json`, with a pen-down dwell of 0.125 s on operation 2 | pen drawing (`select_pen`, `draw_op`, `G4 P0.13` with 2 decimals; `G4 P130` on Marlin, in milliseconds), a pause with no spindle running; metric **and imperial** (the draw comment gives the pen heights in the output units) |
 | `pen-tool-change/` | small two-tool job with a pause (default message) after operation 1 and a pen drawing between the cutters | `select_pen` after a cutter, `select_tool` after the pen, the default pause message |
 | `rest-pocket/` | a 60 x 40 mm pocket, 6 mm cutter with a 2 mm Corners tool (as `PUTIACNC_SHOW_REST` makes it) | the pocket rest pass (`rest_pass`, "corners and narrow parts") |
 | `trochoidal/` | `tests/data/pocket_island.project.json` with trochoidal clearing, as `tests/trochoidal.rs` sets it | with arcs off, only the loops are fitted as G2/G3 (the per-range fitter) |
@@ -68,9 +68,13 @@ rectangle, then a 6 mm cutter inside a 16 mm circle, 1 mm deep in one pass, no r
 third tool of a relief, `tests/data/relief-ledges.project.json`) is not a case: `sample-relief/` already has it, and
 that file alone would add 2 MB.
 
-Two things these files show that are today's behaviour, kept as they are: on Marlin the pen's dwell is written as
-`G4 P..` (Marlin has `G4`, but the spindle wait is left out there), and on Marlin the `-plug` file's header still
-says "Stock", because `pieces.rs` looks for `(Stock ` after Marlin has turned the comment into `; Stock`.
+Two things about Marlin in these files. The pen's dwell is `G4 P` in **milliseconds** (`G4 P130` for 0.13 s), because
+Marlin's `G4` reads `P` as milliseconds (`S` as seconds); the other dialects read `P` as seconds and write `G4 P0.13`.
+Until the change after phase 2 (see `docs/implementation-log.md`) Marlin got `G4 P0.13` too, so the machine waited 0.13 ms;
+only the `marlin-*` files of `pen/` changed then, in their `G4` lines. Marlin has no spindle wait (the operator runs the
+spindle), so the pen's dwell is the only `G4` the post writes there; the `G4 P1` in `opt-start-end-code*/` is the
+machine's own start code, written as given. And the behaviour that is still kept as it is: on Marlin the `-plug` file's
+header still says "Stock", because `pieces.rs` looks for `(Stock ` after Marlin has turned the comment into `; Stock`.
 
 ## Regenerating
 
